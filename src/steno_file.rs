@@ -97,6 +97,11 @@ fn encode_cmd(input: &str, outdir: &str, flags: &[String]) {
     let (frame_trained, st_trained) =
         codec::encode(&raw, &trained).expect("кодирование обученным словарём");
     let enc_t = t.elapsed();
+    // кадр на диск ДО проверки декодером: падение разбирать по файлу
+    fs::create_dir_all(outdir).expect("создание каталога вывода");
+    let stem = file_stem(input);
+    fs::write(format!("{outdir}/{stem}.stuv_trained"), &frame_trained)
+        .expect("запись кадра обуч");
     let t = Instant::now();
     let dec_trained = codec::decode(&frame_trained).expect("декодер обученного кадра");
     let dec_t = t.elapsed();
