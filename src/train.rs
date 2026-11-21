@@ -332,7 +332,9 @@ pub fn train(input: &[u8], base: &Dictionary, cfg: &TrainConfig) -> Result<Dicti
                 continue;
             }
             for syl in syllabify(s) {
-                if syl.len() >= 4 {
+                // слог = слово с одним гласным ядром может быть огромным
+                // (длинные прогоны без пробелов) — проводной лимит декодера
+                if syl.len() >= 4 && syl.len() <= crate::dict::ENTRY_MAX_LEN {
                     *syll_counts.entry(syl).or_insert(0) += c;
                 }
             }
@@ -471,6 +473,22 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let text = format!("{}\n", phrase).repeat(30);
+        let dict = train(text.as_bytes(), &Dictionary::static_only(), &TrainConfig::default()).unwrap();
+        for lane in dict.lanes_snapshot().iter() {
+            for s in lane.iter() {
+                assert!(s.len() <= crate::dict::ENTRY_MAX_LEN);
+            }
+        }
+        let (frame, _) = codec::encode(text.as_bytes(), &dict).unwrap();
+        assert_eq!(codec::decode(&frame).unwrap(), text.as_bytes());
+    }
+
+    #[test]
+    fn long_single_nucleus_run_is_filtered() {
+        // прогон из 300 согласных + «а»: один слог = весь прогон (>256 Б),
+        // обучение обязано его отфильтровать по проводному лимиту
+        let run = format!("{}а", "б".repeat(300));
+        let text = format!("{} хвост текст\n", run).repeat(5);
         let dict = train(text.as_bytes(), &Dictionary::static_only(), &TrainConfig::default()).unwrap();
         for lane in dict.lanes_snapshot().iter() {
             for s in lane.iter() {
