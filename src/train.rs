@@ -333,6 +333,7 @@ pub fn train(input: &[u8], base: &Dictionary, cfg: &TrainConfig) -> Result<Dicti
                 }
             }
         }
+        let uniq_syll_count = syll_counts.len();
         let mut syl: Vec<(u64, usize, String)> = syll_counts
             .into_iter()
             .map(|(s, c)| (c, s.len(), s))
@@ -349,6 +350,12 @@ pub fn train(input: &[u8], base: &Dictionary, cfg: &TrainConfig) -> Result<Dicti
         let want = cfg
             .syllables
             .min(cfg.caps[LANE_SHORT].saturating_sub(trained[LANE_SHORT].len()));
+        eprintln!(
+            "syll-debug: уникальных слогов с len>=4: {}, прошедших MDL: {}, want: {}",
+            uniq_syll_count,
+            syl.len(),
+            want
+        );
         let mut added = 0usize;
         for (_, _, s) in syl {
             if added >= want {
