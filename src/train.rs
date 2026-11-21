@@ -173,6 +173,10 @@ fn count_window(text: &str, cfg: &TrainConfig, counts: &mut Counts) {
             if phrase.len() < cfg.min_phrase_bytes {
                 continue;
             }
+            // проводной лимит декодера: фразы длиннее в словарь не попадают
+            if phrase.len() > crate::dict::ENTRY_MAX_LEN {
+                continue;
+            }
             *counts.phrases.entry(phrase.to_string()).or_insert(0) += 1;
         }
     }
@@ -453,6 +457,26 @@ mod tests {
         cfg.syllables = 0;
         let text = "перегрузка памяти и обычный текст".repeat(50);
         let dict = train(text.as_bytes(), &Dictionary::static_only(), &cfg).unwrap();
+        let (frame, _) = codec::encode(text.as_bytes(), &dict).unwrap();
+        assert_eq!(codec::decode(&frame).unwrap(), text.as_bytes());
+    }
+
+    #[test]
+    fn phrases_over_wire_limit_are_rejected_and_decode_survives() {
+        // фраза из 12 слов по 25 букв (~324 Б) > ENTRY_MAX_LEN(256):
+        // обучение обязано её отфильтровать, кадр обязан декодироваться
+        let word = "а".repeat(25);
+        let phrase = std::iter::repeat(&word[..])
+            .take(12)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!("{}\n", phrase).repeat(30);
+        let dict = train(text.as_bytes(), &Dictionary::static_only(), &TrainConfig::default()).unwrap();
+        for lane in dict.lanes_snapshot().iter() {
+            for s in lane.iter() {
+                assert!(s.len() <= crate::dict::ENTRY_MAX_LEN);
+            }
+        }
         let (frame, _) = codec::encode(text.as_bytes(), &dict).unwrap();
         assert_eq!(codec::decode(&frame).unwrap(), text.as_bytes());
     }
