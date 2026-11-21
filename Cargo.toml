@@ -1,0 +1,22 @@
+[package]
+name = "steno_uv"
+version = "0.1.0"
+edition = "2021"
+description = "Универсальный стенографический кодек: токены 1/2/3/4/5 байт, статический+обучаемый словарь, 100% побайтовая обратимость"
+license = "MIT"
+
+[lib]
+name = "steno_uv"
+path = "src/lib.rs"
+
+[[bin]]
+name = "steno_bench"
+path = "src/main.rs"
+
+[[bin]]
+name = "steno_file"
+path = "src/steno_file.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1

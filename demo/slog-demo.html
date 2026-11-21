@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Слоговый слой — стенографический кодек</title>
+<style>
+  :root { --bg:#0f1420; --card:#171e2e; --line:#2a3550; --ink:#e8edf7; --mut:#93a0ba;
+          --acc:#ffb454; --acc2:#4fc3f7; --vow:#c792ea; --ok:#7ee787; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  .wrap { max-width:960px; margin:0 auto; padding:clamp(14px,4vw,32px); }
+  h1 { font-size:clamp(1.5rem,5.5vw,2.3rem); margin:.2em 0 .1em; }
+  h1 .st { color:var(--acc); }
+  .sub { color:var(--mut); font-size:clamp(.9rem,3vw,1.05rem); margin-bottom:1.4em; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px;
+          padding:clamp(12px,3vw,22px); margin-bottom:18px; }
+  textarea { width:100%; min-height:110px; background:#0c111c; color:var(--ink);
+             border:1px solid var(--line); border-radius:10px; padding:12px;
+             font:inherit; resize:vertical; }
+  button { background:var(--acc); color:#10131a; font-weight:700; border:0;
+           border-radius:10px; padding:10px 18px; font-size:1rem; cursor:pointer; margin-top:10px; }
+  button:hover { filter:brightness(1.08); }
+  .stats { display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; }
+  .stat { background:#0c111c; border:1px solid var(--line); border-radius:10px;
+          padding:8px 14px; min-width:110px; }
+  .stat b { display:block; font-size:clamp(1.05rem,4vw,1.35rem); color:var(--acc2); }
+  .stat span { color:var(--mut); font-size:.82rem; }
+  .word { margin:10px 0 14px; }
+  .word .w { font-weight:700; margin-right:8px; }
+  .word .b { color:var(--mut); font-size:.85rem; margin-left:6px; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; }
+  .chip { display:flex; gap:3px; align-items:center; background:#0c111c;
+          border:1px solid var(--line); border-radius:9px; padding:5px 8px; }
+  .chip .code { color:var(--mut); font-size:.72rem; margin-left:6px; font-family:ui-monospace,monospace; }
+  .key { display:inline-flex; align-items:center; justify-content:center;
+         min-width:clamp(20px,5vw,28px); height:clamp(22px,5.5vw,28px); padding:0 4px;
+         background:#26314b; border:1px solid #3b4a6e; border-bottom-width:3px;
+         border-radius:6px; font-weight:700; font-size:clamp(.8rem,3vw,.95rem); }
+  .key.v { background:var(--vow); border-color:#8e6bb1; color:#1a1026; }
+  .chip.raw .key { background:#3a2f4f; }
+  .tblwrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:.92rem; }
+  th,td { border-bottom:1px solid var(--line); padding:7px 10px; text-align:left;
+          white-space:nowrap; }
+  th { color:var(--mut); font-weight:600; }
+  td.n,th.n { text-align:right; font-variant-numeric:tabular-nums; }
+  .good { color:var(--ok); font-weight:700; }
+  .note { color:var(--mut); font-size:.9rem; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; margin-top:10px; color:var(--mut); font-size:.85rem; }
+  .k { display:inline-block; width:14px; height:14px; border-radius:4px; vertical-align:-2px; margin-right:5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Слоговый слой <span class="st">steno_uv</span></h1>
+  <div class="sub">Демо алгоритма PS14: кириллические слова разбиваются на слоги,
+  каждый частый слог становится «хордой» стенографической машинки — 2-байтным кодом
+  словаря. Слово «компьютер» (18 байт UTF-8) передаётся тремя хордами.</div>
+
+  <div class="card">
+    <textarea id="inp">Компьютер хранит информацию. Скорость передачи данных растёт, и алгоритмы сжатия становятся важнее. Стенографическая запись разбивала слова на слоги — хорды клавиш. Компьютер обрабатывает поток информации, приложение выполняет загрузку, операция завершается успешно.</textarea>
+    <button id="go">Разобрать на хорды</button>
+    <div class="stats" id="stats"></div>
+    <div class="legend">
+      <span><i class="k" style="background:var(--vow)"></i>гласная — ядро слога</span>
+      <span><i class="k" style="background:#26314b"></i>согласная — начало/конец слога</span>
+      <span><i class="k" style="background:#3a2f4f"></i>редкий слог — посимвольно</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin:0 0 8px;font-size:1.15rem">Разбор</h2>
+    <div id="out"></div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin:0 0 8px;font-size:1.15rem">Стоимость передачи</h2>
+    <div class="tblwrap">
+    <table id="tbl">
+      <thead><tr><th>Слово</th><th>Слоги</th><th class="n">UTF-8, Б</th><th class="n">Хорды, Б</th><th class="n">Экономия</th></tr></thead>
+      <tbody></tbody>
+      <tfoot><tr><th>Итого</th><th></th><th class="n" id="tu">0</th><th class="n" id="tc">0</th><th class="n good" id="ts">0%</th></tr></tfoot>
+    </table>
+    </div>
+    <p class="note">Частые слоги получают 1-байтовые коды (верхние 64), остальные —
+    2-байтные коды словаря; одиночные гласные дешевле передать байтом (RAW).
+    В кодеке steno_uv это short-слой словаря: DP-кодировщик сам выбирает
+    «целое слово или слоги» по минимальной стоимости, а поверх хорд работает
+    контекстный кодер (CM), дожимающий повторяющиеся хорды ещё в разы.</p>
+  </div>
+</div>
+
+<script>
+'use strict';
+const VOWELS = new Set(['а','е','ё','и','о','у','ы','э','ю','я']);
+const cyr = w => /^[а-яёА-ЯЁ]+$/.test(w);
+
+// то же слогование, что в train.rs: гласные — ядра, согласные до гласной
+// уходят к следующему слогу, хвост согласных — к последнему слогу
+function syllabify(word) {
+  const w = word.toLowerCase();
+  const ch = [...w];
+  const nuclei = [];
+  for (let i = 0; i < ch.length; i++) if (VOWELS.has(ch[i])) nuclei.push(i);
+  if (!nuclei.length) return [w];
+  const out = [];
+  nuclei.forEach((ni, k) => {
+    const start = k === 0 ? 0 : nuclei[k - 1] + 1;
+    out.push(ch.slice(start, ni + 1).join(''));
+  });
+  const tailStart = nuclei[nuclei.length - 1] + 1;
+  if (tailStart < ch.length) out[out.length - 1] += ch.slice(tailStart).join('');
+  return out;
+}
+const utf8len = s => new TextEncoder().encode(s).length;
+
+// назначение кодов: частота слога по всему тексту → топ-64 однобайтные, остальные 2-байтные
+function assignCodes(allSyll) {
+  const freq = new Map();
+  for (const s of allSyll) freq.set(s, (freq.get(s) || 0) + 1);
+  const sorted = [...freq.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
+  const code = new Map();
+  sorted.forEach(([s, c], i) => {
+    if (utf8len(s) < 4) { code.set(s, { bytes: null, hex: '' }); return; } // посимвольно
+    if (i < 64) code.set(s, { bytes: 1, hex: (0x80 + i).toString(16).toUpperCase().padStart(2,'0') });
+    else if (i < 64 + 8192) {
+      const id = i - 64;
+      code.set(s, { bytes: 2, hex: 'C0 ' + id.toString(16).toUpperCase().padStart(2,'0') });
+    } else code.set(s, { bytes: null, hex: '' });
+  });
+  return code;
+}
+
+function render() {
+  const text = document.getElementById('inp').value;
+  const words = text.match(/[а-яёА-ЯЁ]+/g) || [];
+  const allSyll = [];
+  for (const w of words) allSyll.push(...syllabify(w));
+  const code = assignCodes(allSyll);
+
+  const out = document.getElementById('out');
+  const tbody = document.querySelector('#tbl tbody');
+  out.innerHTML = ''; tbody.innerHTML = '';
+  let tu = 0, tc = 0;
+  const seen = new Set();
+
+  words.forEach(w => {
+    const syls = syllabify(w);
+    const div = document.createElement('div');
+    div.className = 'word';
+    const chips = syls.map(s => {
+      const c = code.get(s);
+      const keys = [...s].map(k => `<span class="key${VOWELS.has(k) ? ' v' : ''}">${k}</span>`).join('');
+      const raw = !c || c.bytes === null;
+      if (!raw) { tu += utf8len(w); tc += c.bytes; }
+      else { tu += utf8len(w); tc += utf8len(s); } // посимвольная передача слога
+      return `<span class="chip${raw ? ' raw' : ''}">${keys}` +
+             `<span class="code">${raw ? 'посимвольно ' + utf8len(s) + ' Б' : c.hex}</span></span>`;
+    }).join('');
+    if (!seen.has(w)) {
+      seen.add(w);
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${w}</td><td>${syls.join('·')}</td>` +
+        `<td class="n">${utf8len(w)}</td><td class="n">${syls.reduce((a, s) => {
+          const c = code.get(s); return a + (c && c.bytes !== null ? c.bytes : utf8len(s));
+        }, 0)}</td><td class="n"></td>`;
+      tbody.appendChild(tr);
+    }
+    const bU = utf8len(w), bC = syls.reduce((a, s) => {
+      const c = code.get(s); return a + (c && c.bytes !== null ? c.bytes : utf8len(s));
+    }, 0);
+    div.innerHTML = `<span class="w">${w}</span>` +
+      `<span class="b">${syls.length} слог(а) · UTF-8 ${bU} Б → хорды ${bC} Б</span>` +
+      `<div class="chips">${chips}</div>`;
+    out.appendChild(div);
+  });
+
+  // частоты слогов для статистики
+  const uniq = new Set(allSyll.filter(s => utf8len(s) >= 4));
+  const H = allSyll.length ? [...new Set(allSyll)].reduce((a, s) => {
+    const p = allSyll.filter(x => x === s).length / allSyll.length;
+    return a - p * Math.log2(p);
+  }, 0) : 0;
+
+  document.getElementById('stats').innerHTML =
+    `<div class="stat"><b>${words.length}</b><span>слов</span></div>` +
+    `<div class="stat"><b>${allSyll.length}</b><span>слогов (хорд)</span></div>` +
+    `<div class="stat"><b>${uniq.size}</b><span>уникальных слогов</span></div>` +
+    `<div class="stat"><b>${H.toFixed(2)}</b><span>H₀ слога, бит</span></div>`;
+
+  document.getElementById('tu').textContent = tu;
+  document.getElementById('tc').textContent = tc;
+  document.getElementById('ts').textContent =
+    tu ? Math.round((1 - tc / tu) * 100) + '%' : '0%';
+}
+document.getElementById('go').addEventListener('click', render);
+render();
+</script>
+</body>
+</html>
