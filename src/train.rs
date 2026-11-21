@@ -41,7 +41,7 @@ impl Default for TrainConfig {
             max_atoms: 10,
             min_phrase_bytes: 7,
             min_count: 3,
-            caps: [32, 2048, 20_000, 20_000, 10_000],
+            caps: [32, 6000, 20_000, 20_000, 10_000],
             candidate_cap: 512,
             syllables: 700,
         }
