@@ -1,0 +1,8 @@
+BENCH	677647	w=0	frame=19434439	archive=7900725	enc_s=88.22	dec_s=34.03
+BENCH	677647	w=1	frame=19461659	archive=7985298	enc_s=115.15	dec_s=37.06
+BENCH	677647	w=2	frame=19595972	archive=8046528	enc_s=113.24	dec_s=29.15
+BENCH	677647	w=4	frame=20287025	archive=8203406	enc_s=107.11	dec_s=30.63
+BENCH	mixed_10mb_compression_test	w=0	frame=10773311	archive=4727929	enc_s=33.20	dec_s=15.55
+BENCH	mixed_10mb_compression_test	w=1	frame=10787009	archive=4689267	enc_s=34.79	dec_s=15.80
+BENCH	mixed_10mb_compression_test	w=2	frame=10795636	archive=4690445	enc_s=31.06	dec_s=15.84
+BENCH	mixed_10mb_compression_test	w=4	frame=10802690	archive=4694885	enc_s=35.61	dec_s=15.68
