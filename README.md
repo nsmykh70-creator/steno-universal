@@ -31,7 +31,25 @@ target/release/steno_file decode <кадр> <выход>
 target/release/steno_file dumpstreams <кадр> <каталог>
 target/release/steno_file frec <ctrl> <каталог> [--order0]
 target/release/steno_file cmz <ctrl> <каталог>
+target/release/steno_file cmz-frame <кадр> <каталог>
+target/release/steno_file cmz-frame-decode <файл.frame.cmz> <выход>
 ```
+
+## Финальные стадии архива (PS19)
+
+Три способа упаковать кадр (в бенче выбирается меньший; каждый финал
+проверяется полной распаковкой до побайтового сравнения с исходником):
+
+1. **xz-кадр** — внешним `xz -9e`: самый быстрый (fb2 ~12 c), распаковка
+   ~1 c; кросс-совпадения «словарь ↔ payload» дают −5.9% против PS17.
+2. **cmz-split** — PS17-стиль: `xz(hdr) + cmz(ctrl) + cmz(data)`.
+3. **cmz-frame** (`cmz-frame`/`cmz-frame-decode`) — CM-кодер по кадру
+   целиком: энтропийный кодер видит кросс-совпадения «словарь ↔ payload»;
+   на fb2 −8.6% против PS17 (7 220 882 против 7 900 725).
+
+Дефолт `candidate_cap` поднят 512 → 8000 (PS19): оптимум финального
+размера. Большие пулы (12000/20000) продолжают уменьшать кадр, но
+сжатый финал ухудшается — payload мельчает и хуже моделируется.
 
 Тесты: `cargo test --release`.
 
