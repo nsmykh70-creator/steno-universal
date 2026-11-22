@@ -76,6 +76,17 @@ fn parse_flags(args: &[String]) -> TrainConfig {
                     .unwrap_or(cfg.syllables);
                 i += 2;
             }
+            "--onc" => {
+                cfg.onc_parts = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(cfg.onc_parts);
+                i += 2;
+            }
+            "--no-stems" => {
+                cfg.stem_flex = false;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
@@ -95,7 +106,21 @@ fn encode_cmd(input: &str, outdir: &str, flags: &[String]) {
     let t = Instant::now();
     let dec_static = codec::decode(&frame_static).expect("декодер статического кадра");
     let dec_s = t.elapsed();
-    assert_eq!(dec_static, raw, "roundtrip статического кадра не сошёлся");
+    if dec_static != raw {
+        let diff = dec_static
+            .iter()
+            .zip(raw.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(dec_static.len().min(raw.len()));
+        panic!(
+            "roundtrip статического кадра не сошёлся: расхождение на байте {} из {} (длина декода {})\nисходник: {:?}\nдекод:    {:?}",
+            diff,
+            raw.len(),
+            dec_static.len(),
+            &raw[diff.saturating_sub(24)..(diff + 24).min(raw.len())],
+            &dec_static[diff.saturating_sub(24)..(diff + 24).min(dec_static.len())]
+        );
+    }
 
     // train(): при невалидном UTF-8 возвращает базовый словарь без изменений
     let t = Instant::now();
@@ -113,7 +138,21 @@ fn encode_cmd(input: &str, outdir: &str, flags: &[String]) {
     let t = Instant::now();
     let dec_trained = codec::decode(&frame_trained).expect("декодер обученного кадра");
     let dec_t = t.elapsed();
-    assert_eq!(dec_trained, raw, "roundtrip обученного кадра не сошёлся");
+    if dec_trained != raw {
+        let diff = dec_trained
+            .iter()
+            .zip(raw.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(dec_trained.len().min(raw.len()));
+        panic!(
+            "roundtrip обученного кадра не сошёлся: расхождение на байте {} из {} (длина декода {})\nисходник: {:?}\nдекод:    {:?}",
+            diff,
+            raw.len(),
+            dec_trained.len(),
+            &raw[diff.saturating_sub(32)..(diff + 32).min(raw.len())],
+            &dec_trained[diff.saturating_sub(32)..(diff + 32).min(dec_trained.len())]
+        );
+    }
 
     fs::create_dir_all(outdir).expect("создание каталога вывода");
     let stem = file_stem(input);

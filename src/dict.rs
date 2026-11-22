@@ -88,28 +88,42 @@ impl Dictionary {
     /// Сборка из статических и обучаемых списков. Дубликаты по всем слоям
     /// отбрасываются (остаётся первое вхождение). Ошибка — при переполнении
     /// кодового пространства слоя.
+/// Нормализация записи словаря (PS17): записи с восстанавливаемым регистром
+/// хранятся в нижнем регистре (регистр восстанавливается флагами кадра
+/// TAG_CAP/TAG_UPPER), смешанные и небуквенные — остаются как есть.
+/// Выравнивание байтов гарантируется case_normalize.
+fn norm_entry(e: &str) -> String {
+    let (n, _) = crate::codec::case_normalize(e.as_bytes());
+    match String::from_utf8(n) {
+        Ok(s) => s,
+        Err(_) => e.to_string(),
+    }
+}
+
     pub fn build(
         static_lanes: [&[&str]; 5],
         trained_lanes: [&[&str]; 5],
     ) -> Result<Dictionary, String> {
         let mut lanes: [Vec<Box<str>>; 5] = Default::default();
         let mut static_counts = [0usize; 5];
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut deduped = 0usize;
         for (lane, list) in static_lanes.iter().enumerate() {
             for s in *list {
-                if !seen.insert(s) {
+                let ns = Self::norm_entry(s);
+                if !seen.insert(ns.clone()) {
                     deduped += 1;
                     continue;
                 }
                 static_counts[lane] += 1;
-                lanes[lane].push(Box::from(*s));
+                lanes[lane].push(ns.into_boxed_str());
             }
         }
         let mut trained_bytes = 0usize;
         for (lane, list) in trained_lanes.iter().enumerate() {
             for s in *list {
-                if !seen.insert(s) {
+                let ns = Self::norm_entry(s);
+                if !seen.insert(ns.clone()) {
                     deduped += 1;
                     continue;
                 }
@@ -121,9 +135,9 @@ impl Dictionary {
                         WIRE_CAPS[lane]
                     ));
                 }
-                let bytes = s.as_bytes();
+                let bytes = ns.as_bytes();
                 trained_bytes += varint_len(bytes.len() as u64) + bytes.len();
-                lanes[lane].push(Box::from(*s));
+                lanes[lane].push(ns.into_boxed_str());
             }
         }
         let mut trie = Trie::new();

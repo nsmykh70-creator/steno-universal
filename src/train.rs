@@ -31,6 +31,10 @@ pub struct TrainConfig {
     pub candidate_cap: usize,
     /// Число слоговых хорд для short-слоя (PS14; 0 — выключить слой).
     pub syllables: usize,
+    /// Предел ONC-частей слогов (onset/coda) в short-слое (PS17; 0 — выключить).
+    pub onc_parts: usize,
+    /// Отделять основу от флексии частых окончаний (PS17).
+    pub stem_flex: bool,
 }
 
 impl Default for TrainConfig {
@@ -46,6 +50,9 @@ impl Default for TrainConfig {
             caps: [32, 6000, 20_000, 20_000, 10_000],
             candidate_cap: 512,
             syllables: 700,
+            // PS17: ONC-части слогов (onset/coda) и основа/флексия
+            onc_parts: 400,
+            stem_flex: true,
         }
     }
 }
@@ -232,7 +239,11 @@ fn mdl_gross(count: u64, bytes: usize, lane: usize) -> f64 {
 /// Обучение: словарь = статический базовый + обучаемые записи.
 /// Невалидный UTF-8 или пустой вход возвращают базовый словарь без изменений.
 pub fn train(input: &[u8], base: &Dictionary, cfg: &TrainConfig) -> Result<Dictionary, &'static str> {
-    let text = match std::str::from_utf8(input) {
+    // PS17: обучение по регистр-нормализованной копии — счётчики «Анна»/«анна»
+    // сливаются, записи словаря хранятся в нижнем регистре, регистр
+    // восстанавливается флагами кадра (codec::case_normalize).
+    let norm_bytes = crate::codec::case_normalize(input).0;
+    let text = match std::str::from_utf8(&norm_bytes) {
         Ok(t) if !t.is_empty() => t,
         _ => return Ok(clone_dictionary(base)),
     };
@@ -341,17 +352,31 @@ pub fn train(input: &[u8], base: &Dictionary, cfg: &TrainConfig) -> Result<Dicti
     // short-слой (2-байтные коды). DP-кодировщик сам выберет «слово или слоги»
     // по стоимости через trie. Слог ценен повторами между разными словами,
     // поэтому считаются все OOV-вхождения, а не только точные повторы слова.
+    // Параллельно считаются ONC-части слогов (PS17): onset/coda собирают
+    // OOV-слоги, которых нет в слоговом словаре, без «дыр» словаря.
+    let mut onc_counts: std::collections::HashMap<String, u64> = Default::default();
     if cfg.syllables > 0 {
         let mut syll_counts: std::collections::HashMap<String, u64> = Default::default();
         for (s, c) in &counts.atoms {
             if covered.contains(s) || !is_cyrillic_word(s) {
                 continue;
             }
-            for syl in syllabify(s) {
+            let sylls = syllabify(s);
+            for syl in &sylls {
                 // слог = слово с одним гласным ядром может быть огромным
                 // (длинные прогоны без пробелов) — проводной лимит декодера
                 if syl.len() >= 4 && syl.len() <= crate::dict::ENTRY_MAX_LEN {
-                    *syll_counts.entry(syl).or_insert(0) += c;
+                    *syll_counts.entry(syl.clone()).or_insert(0) += c;
+                }
+            }
+            if cfg.onc_parts > 0 {
+                for syl in &sylls {
+                    for part in onc_parts(syl) {
+                        // 1-буквенные части не дают выигрыша против RAW
+                        if part.len() >= 4 && part.len() <= crate::dict::ENTRY_MAX_LEN {
+                            *onc_counts.entry(part).or_insert(0) += c;
+                        }
+                    }
                 }
             }
         }
@@ -389,8 +414,155 @@ pub fn train(input: &[u8], base: &Dictionary, cfg: &TrainConfig) -> Result<Dicti
             trained[LANE_SHORT].push(s);
             added += 1;
         }
+        // ONC-части (PS17): заполняют остаток short-лимита после целых слогов
+        if cfg.onc_parts > 0 {
+            let mut onc: Vec<(u64, usize, String)> = onc_counts
+                .into_iter()
+                .map(|(s, c)| (c, s.len(), s))
+                .filter(|&(c, b, _)| mdl_gross(c, b, LANE_SHORT) > 0.0)
+                .collect();
+            onc.sort_by(|x, y| {
+                let gx = mdl_gross(x.0, x.1, LANE_SHORT);
+                let gy = mdl_gross(y.0, y.1, LANE_SHORT);
+                gy.partial_cmp(&gx)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| x.2.cmp(&y.2))
+            });
+            let want_onc =
+                cfg.onc_parts.min(cfg.caps[LANE_SHORT].saturating_sub(trained[LANE_SHORT].len()));
+            let mut added_onc = 0usize;
+            for (_, _, s) in onc {
+                if added_onc >= want_onc {
+                    break;
+                }
+                if base.find(&s).is_some() || !taken.insert(s.clone()) {
+                    continue;
+                }
+                trained[LANE_SHORT].push(s);
+                added_onc += 1;
+            }
+        }
+    }
+    // Основа/флексия (PS17): у OOV-слов отбрасываются частые русские
+    // окончания; основы идут в regular-слой (3-байтовые коды), окончания —
+    // в short (2-байтовые). DP через trie сам соберёт «основа+окончание».
+    if cfg.stem_flex {
+        let mut stem_counts: std::collections::HashMap<String, u64> = Default::default();
+        let mut end_counts: std::collections::HashMap<String, u64> = Default::default();
+        for (s, c) in &counts.atoms {
+            if covered.contains(s) || !is_cyrillic_word(s) {
+                continue;
+            }
+            let b = s.len();
+            // короче 8 байт — зона слов и слогов; длиннее 24 — прогоны
+            if b < 8 || b > 24 {
+                continue;
+            }
+            if let Some((stem, end)) = strip_ending(s) {
+                *stem_counts.entry(stem).or_insert(0) += c;
+                *end_counts.entry(end).or_insert(0) += c;
+            }
+        }
+        let mut ends: Vec<(u64, usize, String)> = end_counts
+            .into_iter()
+            .map(|(s, c)| (c, s.len(), s))
+            .filter(|&(c, b, _)| mdl_gross(c, b, LANE_SHORT) > 0.0)
+            .collect();
+        ends.sort_by(|x, y| {
+            let gx = mdl_gross(x.0, x.1, LANE_SHORT);
+            let gy = mdl_gross(y.0, y.1, LANE_SHORT);
+            gy.partial_cmp(&gx)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| x.2.cmp(&y.2))
+        });
+        let want_end = cfg.caps[LANE_SHORT].saturating_sub(trained[LANE_SHORT].len());
+        let mut added_end = 0usize;
+        for (_, _, s) in ends {
+            if added_end >= want_end {
+                break;
+            }
+            if base.find(&s).is_some() || !taken.insert(s.clone()) {
+                continue;
+            }
+            trained[LANE_SHORT].push(s);
+            added_end += 1;
+        }
+        let mut stems: Vec<(u64, usize, String)> = stem_counts
+            .into_iter()
+            .map(|(s, c)| (c, s.len(), s))
+            .filter(|&(c, b, _)| mdl_gross(c, b, LANE_REGULAR) > 0.0)
+            .collect();
+        stems.sort_by(|x, y| {
+            let gx = mdl_gross(x.0, x.1, LANE_REGULAR);
+            let gy = mdl_gross(y.0, y.1, LANE_REGULAR);
+            gy.partial_cmp(&gx)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| x.2.cmp(&y.2))
+        });
+        let want_stem = cfg.caps[LANE_REGULAR].saturating_sub(trained[LANE_REGULAR].len());
+        let mut added_stem = 0usize;
+        for (_, _, s) in stems {
+            if added_stem >= want_stem {
+                break;
+            }
+            if base.find(&s).is_some() || !taken.insert(s.clone()) {
+                continue;
+            }
+            trained[LANE_REGULAR].push(s);
+            added_stem += 1;
+        }
     }
     build_with_trained(&trained)
+}
+
+/// Гласные русского языка (общие для syllabify и onc_parts).
+const VOWELS: [char; 10] = ['а', 'е', 'ё', 'и', 'о', 'у', 'ы', 'э', 'ю', 'я'];
+
+/// ONC-части слога (PS17): согласный кластер до гласного ядра (onset) и
+/// после него (coda). Части короче двух букв не дают выигрыша против
+/// RAW-байтов и не возвращаются; ядро-одиночка тоже.
+pub fn onc_parts(syl: &str) -> Vec<String> {
+    let chars: Vec<char> = syl.chars().collect();
+    let mut out = Vec::new();
+    if let Some(k) = chars.iter().position(|&c| VOWELS.contains(&c)) {
+        let onset: String = chars[..k].iter().collect();
+        let coda: String = chars[k + 1..].iter().collect();
+        if onset.chars().count() >= 2 {
+            out.push(onset);
+        }
+        if coda.chars().count() >= 2 {
+            out.push(coda);
+        }
+    }
+    out
+}
+
+/// Частые русские окончания для отбрасывания флексии (PS17).
+const RU_ENDINGS: [&str; 51] = [
+    "ами", "ями", "ого", "его", "ому", "ему", "ыми", "ими",
+    "ая", "яя", "ое", "ее", "ые", "ие", "ий", "ый", "ой", "ей",
+    "ом", "ем", "ах", "ях", "ам", "ям", "ов", "ев", "ою", "ею",
+    "ую", "юю", "ых", "их", "ье", "ья", "ью", "ся", "сь",
+    "а", "я", "у", "ю", "е", "о", "и", "ы", "ь", "й",
+    "ет", "ют", "ат", "ит",
+];
+
+/// Отбрасывание окончания: длинные приоритетнее, основа — не короче трёх букв.
+/// Возвращает (основа, окончание).
+pub fn strip_ending(word: &str) -> Option<(String, String)> {
+    let mut best: Option<(usize, &str)> = None;
+    for e in RU_ENDINGS.iter() {
+        if word.ends_with(e) {
+            let el = e.chars().count();
+            let wl = word.chars().count();
+            if wl - el >= 3 && best.map(|(bel, _)| el > bel).unwrap_or(true) {
+                best = Some((el, e));
+            }
+        }
+    }
+    let (_, e) = best?;
+    let stem_len = word.len() - e.len();
+    Some((word[..stem_len].to_string(), e.to_string()))
 }
 
 fn build_with_trained(trained: &[Vec<String>; 5]) -> Result<Dictionary, &'static str> {

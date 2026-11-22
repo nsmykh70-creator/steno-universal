@@ -18,6 +18,162 @@ const RUN_MAX: usize = 32;
 /// Теги первого байта.
 const TAG_RUN: u8 = 0xFC;
 const TAG_RAW: u8 = 0xFD;
+/// Регистр-флаги (PS17): следующий токен словаря печатается
+/// «Как Слово» (CAP) или «КАПСОМ» (UPPER). Словарь хранит слова
+/// в нижнем регистре — счётчики частот не дробятся между формами.
+const TAG_CAP: u8 = 0xFE;
+const TAG_UPPER: u8 = 0xFF;
+
+/// Нормализация регистра кириллических слов (PS17).
+/// Возвращает (нормализованную копию, флаги по байтам: 0/1=CAP/2=UPPER).
+/// Слово нормализуется ТОЛЬКО если восстановление точно: все буквы,
+/// кроме первой (CAP), и так были в нижнем регистре, либо всё слово
+/// капсом (UPPER); смешанные слова остаются без изменений.
+/// Длины байтов сохраняются по каждой позиции (требование DP-выравнивания);
+/// невалидный UTF-8 копируется байт-в-байт без флагов.
+pub fn case_normalize(input: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut norm = Vec::with_capacity(input.len());
+    let mut flags = vec![0u8; input.len()];
+    let mut i = 0usize;
+    while i < input.len() {
+        match std::str::from_utf8(&input[i..]) {
+            Ok(s) => {
+                let (n2, f2) = case_normalize_chunk(s.as_bytes());
+                norm.extend_from_slice(&n2);
+                for (j, fl) in f2.into_iter().enumerate() {
+                    flags[i + j] = fl;
+                }
+                i = input.len();
+            }
+            Err(e) => {
+                let k = e.valid_up_to();
+                if k > 0 {
+                    let (n2, f2) = case_normalize_chunk(&input[i..i + k]);
+                    norm.extend_from_slice(&n2);
+                    for (j, fl) in f2.into_iter().enumerate() {
+                        flags[i + j] = fl;
+                    }
+                }
+                // невалидный байт копируется как есть (выравнивание 1:1)
+                norm.push(input[i + k]);
+                i += k + 1;
+            }
+        }
+    }
+    (norm, flags)
+}
+
+/// Один валидный UTF-8 кусок: флаги CAP/UPPER на началах слов.
+fn case_normalize_chunk(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let s = std::str::from_utf8(bytes).expect("кусок валиден");
+    let mut norm = Vec::with_capacity(s.len());
+    let mut flags = vec![0u8; s.len()];
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut emit_c = |c: char, norm: &mut Vec<u8>| {
+        let mut buf = [0u8; 4];
+        norm.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    };
+    let mut wi = 0usize;
+    while wi < chars.len() {
+        while wi < chars.len() && !chars[wi].1.is_alphabetic() {
+            emit_c(chars[wi].1, &mut norm);
+            wi += 1;
+        }
+        if wi >= chars.len() {
+            break;
+        }
+        let ws = wi;
+        while wi < chars.len() && chars[wi].1.is_alphabetic() {
+            wi += 1;
+        }
+        let word: String = chars[ws..wi].iter().map(|&(_, c)| c).collect();
+        let lower = word.to_lowercase();
+        // выравнивание: каждая буква обязана сохранять длину в байтах
+        let len_ok =
+            word.chars().zip(lower.chars()).all(|(a, b)| a.len_utf8() == b.len_utf8());
+        if !len_ok {
+            for &(_, c) in &chars[ws..wi] {
+                emit_c(c, &mut norm);
+            }
+            continue;
+        }
+        if word.chars().count() > 1 && word == word.to_uppercase() && word != lower {
+            // «РОМАНЫ» → «романы» + флаг UPPER на КАЖДОМ байте слова (PS17):
+            // токен может накрыть лишь часть слова (слог, ONC-часть), и каждый
+            // такой кусок обязан нести флаг, чтобы напечататься капсом
+            let end_byte = chars[wi - 1].0 + chars[wi - 1].1.len_utf8();
+            for fl_idx in chars[ws].0..end_byte {
+                flags[fl_idx] = 2;
+            }
+            for c in lower.chars() {
+                emit_c(c, &mut norm);
+            }
+        } else {
+            let mut it = word.chars();
+            let first = it.next().unwrap_or('\u{0}');
+            let rest: String = it.collect();
+            let rest_lower = rest == rest.to_lowercase();
+            if first.is_uppercase() && rest_lower && !rest.is_empty() {
+                // «Левин» → «левин» + флаг CAP
+                flags[chars[ws].0] = 1;
+                emit_c(first.to_lowercase().next().unwrap_or(first), &mut norm);
+                for c in rest.chars() {
+                    emit_c(c, &mut norm);
+                }
+            } else {
+                // смешанный регистр — точного восстановления нет, как есть
+                for &(_, c) in &chars[ws..wi] {
+                    emit_c(c, &mut norm);
+                }
+            }
+        }
+    }
+    (norm, flags)
+}
+
+/// Флаг регистра для токена длиной len в позиции i (по нормализованным
+/// байтам norm). Допустимые картины флагов в промежутке [i, i+len):
+/// 1) все нули — простой токен (норма совпадает с оригиналом);
+/// 2) все двойки — кусок UPPER-слова целиком (печатается капсом одним флагом);
+/// 3) [0×k, 1, 0…] — CAP-слово (возможно после не-буквенного ASCII-префикса:
+///    запись вида « english» поднимает первую буквенную позицию);
+/// 4) [0×k, 2, 2…] — то же для UPPER-слова.
+/// Всё остальное — 0xFF: токен запрещён (регистр не восстановить).
+fn token_flag(
+    flags: &[u8],
+    norm: &[u8],
+    i: usize,
+    len: usize,
+) -> u8 {
+    let end = i + len;
+    let span = &flags[i..end];
+    // картина «все нули» / «все двойки»
+    let first = span[0];
+    if span.iter().all(|&f| f == first) {
+        return first; // 0 — простой, 2 — UPPER-кусок; 1 «весь промежуток» невозможен
+    }
+    // есть смесь: первый ненулевой флаг обязан стоять после не-буквенного
+    // ASCII-префикса, а хвост после него — однородный
+    let p = match span.iter().position(|&f| f != 0) {
+        Some(p) => p,
+        None => return 0,
+    };
+    let f = span[p];
+    let tail_ok = match f {
+        1 => span[p + 1..].iter().all(|&x| x == 0),
+        2 => span[p + 1..].iter().all(|&x| x == 2),
+        _ => false,
+    };
+    if !tail_ok {
+        return 0xFF;
+    }
+    for &b in &norm[i..i + p] {
+        if b >= 0x80 || b.is_ascii_alphanumeric() || b == b'_' {
+            return 0xFF;
+        }
+    }
+    f
+}
 
 /// Коды операций DP (старшие 3 бита упакованного слова).
 const OP_ASCII: u32 = 0;
@@ -68,8 +224,11 @@ pub fn encode(input: &[u8], dict: &Dictionary) -> Result<(Vec<u8>, EncodeStats),
     let mut ops = vec![0u32; n + 1];
     cost[n] = 0;
     let trie = dict.trie();
+    // нормализация регистра: три матчится по нормализованной копии,
+    // эмиссия берёт исходные байты; флаги вшиваются перед токенами слов
+    let (norm, flags) = case_normalize(input);
     for i in (0..n).rev() {
-        let b = input[i];
+        let b = norm[i];
         let mut best = u32::MAX;
         let mut best_op = 0u32;
         if b < 0x80 {
@@ -97,13 +256,17 @@ pub fn encode(input: &[u8], dict: &Dictionary) -> Result<(Vec<u8>, EncodeStats),
                 }
             }
         }
-        for (len, entry) in trie.matches_at(input, i) {
+        for (len, entry) in trie.matches_at(&norm, i) {
+            let fl = token_flag(&flags, &norm, i, len);
+            if fl == 0xFF {
+                continue; // внутри промежутка другой флаг — запись не восстановит регистр
+            }
             let (lane, id) = unpack_entry(entry);
             let next = cost[i + len];
             if next == u32::MAX {
                 continue;
             }
-            let c = Dictionary::token_width(lane) as u32 + next;
+            let c = fl as u32 + Dictionary::token_width(lane) as u32 + next;
             // `<=`: при равной стоимости предпочитаем более длинное совпадение
             if c <= best {
                 best = c;
@@ -145,12 +308,19 @@ pub fn encode(input: &[u8], dict: &Dictionary) -> Result<(Vec<u8>, EncodeStats),
                 i += 1;
                 st.raw_byte += 1;
             }
-            lane_op => {
-                let lane = (lane_op - OP_TOKEN) as usize;
-                let id = arg as u64;
-                let entry_len = dict.entry(lane, id).len();
-                dict.encode_token(lane, id, &mut payload);
-                i += entry_len;
+        lane_op => {
+            let lane = (lane_op - OP_TOKEN) as usize;
+            let id = arg as u64;
+            let entry_len = dict.entry(lane, id).len();
+            // тот же расчёт флага, что и в DP: CAP/UPPER перед токеном
+            let fl = token_flag(&flags, &norm, i, entry_len);
+            if fl == 1 {
+                payload.push(TAG_CAP);
+            } else if fl == 2 {
+                payload.push(TAG_UPPER);
+            }
+            dict.encode_token(lane, id, &mut payload);
+            i += entry_len;
                 match lane {
                     LANE_SYMBOL => st.symbol += 1,
                     LANE_SHORT => st.short += 1,
@@ -197,14 +367,21 @@ pub fn decode(frame: &[u8]) -> Result<Vec<u8>, &'static str> {
     pos += 8;
     let out_len = get_uvarint(frame, &mut pos)? as usize;
     let mut out: Vec<u8> = Vec::with_capacity(out_len.min(64 * 1024 * 1024));
+    let mut pending_case = 0u8; // 0 — нет; 1 — CAP; 2 — UPPER
     while pos < frame.len() {
         let lead = frame[pos];
         pos += 1;
         match lead {
-            0x00..=0x7F => out.push(lead),
+            0x00..=0x7F => {
+                if pending_case != 0 {
+                    return Err("регистр-флаг перед литеральным байтом");
+                }
+                out.push(lead)
+            }
             0x80..=0xBF => {
                 let id = (lead - 0x80) as u64;
-                append_entry(&dict, LANE_SYMBOL, id, &mut out)?;
+                append_entry(&dict, LANE_SYMBOL, id, pending_case, &mut out)?;
+                pending_case = 0;
             }
             0xC0..=0xDF => {
                 if pos >= frame.len() {
@@ -212,7 +389,8 @@ pub fn decode(frame: &[u8]) -> Result<Vec<u8>, &'static str> {
                 }
                 let id = (((lead - 0xC0) as u64) << 8) | frame[pos] as u64;
                 pos += 1;
-                append_entry(&dict, LANE_SHORT, id, &mut out)?;
+                append_entry(&dict, LANE_SHORT, id, pending_case, &mut out)?;
+                pending_case = 0;
             }
             0xE0..=0xEF => {
                 if pos + 2 > frame.len() {
@@ -222,7 +400,8 @@ pub fn decode(frame: &[u8]) -> Result<Vec<u8>, &'static str> {
                     | ((frame[pos] as u64) << 8)
                     | frame[pos + 1] as u64;
                 pos += 2;
-                append_entry(&dict, LANE_REGULAR, id, &mut out)?;
+                append_entry(&dict, LANE_REGULAR, id, pending_case, &mut out)?;
+                pending_case = 0;
             }
             0xF0..=0xF7 => {
                 if pos + 3 > frame.len() {
@@ -233,7 +412,8 @@ pub fn decode(frame: &[u8]) -> Result<Vec<u8>, &'static str> {
                     | ((frame[pos + 1] as u64) << 8)
                     | frame[pos + 2] as u64;
                 pos += 3;
-                append_entry(&dict, LANE_STRUCT, id, &mut out)?;
+                append_entry(&dict, LANE_STRUCT, id, pending_case, &mut out)?;
+                pending_case = 0;
             }
             0xF8..=0xFB => {
                 if pos + 4 > frame.len() {
@@ -245,9 +425,19 @@ pub fn decode(frame: &[u8]) -> Result<Vec<u8>, &'static str> {
                     | ((frame[pos + 2] as u64) << 8)
                     | frame[pos + 3] as u64;
                 pos += 4;
-                append_entry(&dict, LANE_EXTENDED, id, &mut out)?;
+                append_entry(&dict, LANE_EXTENDED, id, pending_case, &mut out)?;
+                pending_case = 0;
+            }
+            TAG_CAP | TAG_UPPER => {
+                if pending_case != 0 {
+                    return Err("двойной регистр-флаг");
+                }
+                pending_case = if lead == TAG_CAP { 1 } else { 2 };
             }
             TAG_RUN => {
+                if pending_case != 0 {
+                    return Err("регистр-флаг перед литеральной цепочкой");
+                }
                 let len = get_uvarint(frame, &mut pos)? as usize;
                 if len == 0 {
                     return Err("литеральная цепочка нулевой длины");
@@ -259,6 +449,9 @@ pub fn decode(frame: &[u8]) -> Result<Vec<u8>, &'static str> {
                 pos += len;
             }
             TAG_RAW => {
+                if pending_case != 0 {
+                    return Err("регистр-флаг перед RAW-байтом");
+                }
                 if pos >= frame.len() {
                     return Err("усечённый RAW-байт");
                 }
@@ -271,6 +464,9 @@ pub fn decode(frame: &[u8]) -> Result<Vec<u8>, &'static str> {
             return Err("выход превышает объявленную длину");
         }
     }
+    if pending_case != 0 {
+        return Err("регистр-флаг в конце кадра без токена");
+    }
     if out.len() != out_len {
         return Err("выход короче объявленной длины");
     }
@@ -281,13 +477,37 @@ fn append_entry(
     dict: &Dictionary,
     lane: usize,
     id: u64,
+    case: u8,
     out: &mut Vec<u8>,
 ) -> Result<(), &'static str> {
     let list = dict.lane(lane);
     if id as usize >= list.len() {
         return Err("токен ссылается на неизвестный ID словаря");
     }
-    out.extend_from_slice(dict.entry(lane, id).as_bytes());
+    let entry = dict.entry(lane, id);
+    match case {
+        0 => out.extend_from_slice(entry.as_bytes()),
+        // «Как Слово»: первая БУКВЕННАЯ позиция записи верхним регистром
+        // (запись может начинаться с пробела/пунктуации: « english» → « English»)
+        1 => {
+            let mut done = false;
+            for c in entry.chars() {
+                if !done && c.is_alphabetic() {
+                    let up: String = c.to_uppercase().collect();
+                    out.extend_from_slice(up.as_bytes());
+                    done = true;
+                } else {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+        // «КАПСОМ»: все буквы верхним регистром
+        _ => {
+            let up: String = entry.to_uppercase();
+            out.extend_from_slice(up.as_bytes());
+        }
+    }
     Ok(())
 }
 
@@ -454,6 +674,11 @@ pub fn split_streams(frame: &[u8]) -> Result<StreamSplit, &'static str> {
             w.data.push(frame[pos]);
             pos += 1;
             w.raw_tokens += 1;
+        } else if lead == TAG_CAP || lead == TAG_UPPER {
+            // регистр-флаг: один байт в ctrl, в data ничего
+            pos += 1;
+            w.ctrl.push(lead);
+            w.token_tokens += 1;
         } else if lead >= 0xFC {
             return Err("зарезервированный лид-байт в потоке токенов");
         } else {
@@ -519,6 +744,9 @@ fn payload_from_streams(ctrl: &[u8], data: &[u8]) -> Result<Vec<u8>, &'static st
             payload.push(TAG_RAW);
             payload.push(data[di]);
             di += 1;
+        } else if b == TAG_CAP || b == TAG_UPPER {
+            // регистр-флаг: один байт в payload, data не расходует
+            payload.push(b);
         } else {
             let width = token_width_from_lead(b);
             if ci - 1 + width > ctrl.len() {
@@ -537,6 +765,53 @@ fn payload_from_streams(ctrl: &[u8], data: &[u8]) -> Result<Vec<u8>, &'static st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Словарь с кириллическими словами в нижнем регистре + фразой-ловушкой.
+    /// Слова кладутся в ОБУЧАЕМЫЕ слои: статические таблицы — константы
+    /// формата (декодер берёт их из vocab), обучаемые передаются в кадре.
+    fn case_dict() -> Dictionary {
+        let short = ["левин", "анна", "эхо", "окна"];
+        let regular = ["анна каренина"];
+        Dictionary::build(
+            [
+                crate::vocab::SYMBOL_STATIC,
+                crate::vocab::SHORT_STATIC,
+                crate::vocab::REGULAR_STATIC,
+                crate::vocab::STRUCT_STATIC,
+                crate::vocab::EXTENDED_STATIC,
+            ],
+            [&[], &short[..], &regular[..], &[], &[]],
+        )
+        .expect("тестовый словарь")
+    }
+
+    #[test]
+    fn case_flags_roundtrip() {
+        let d = case_dict();
+        let src = "Левин сказал ПРИВЕТ, Анна сидела у ОКНА. Эхо, эхо, ЭХО… и анна.";
+        let (frame, _) = encode(src.as_bytes(), &d).unwrap();
+        assert_eq!(decode(&frame).unwrap(), src.as_bytes());
+        let split = split_streams(&frame).unwrap();
+        let packed = pack_frame(&frame[..split.header_len], &split.ctrl, &split.data).unwrap();
+        assert_eq!(packed, frame, "регистр-флаги обязаны переживать split/pack");
+        assert_eq!(decode(&packed).unwrap(), src.as_bytes());
+        // флаги обязаны попасть в ctrl-поток
+        assert!(
+            split.ctrl.contains(&TAG_CAP) || split.ctrl.contains(&TAG_UPPER),
+            "в кадре должны быть регистр-флаги: {src:?}"
+        );
+    }
+
+    #[test]
+    fn multi_cap_phrase_forbidden() {
+        // «Анна Каренина» — фраза с двумя капиталами: однотокенное кодирование
+        // запрещено (декодер не восстановит второй капитал), DP обязан
+        // разбить её на слова с флагами; нижний регистр — разрешён.
+        let d = case_dict();
+        let caps = "Анна Каренина вошла в анна каренина записи";
+        let (frame, _) = encode(caps.as_bytes(), &d).unwrap();
+        assert_eq!(decode(&frame).unwrap(), caps.as_bytes());
+    }
 
     #[test]
     fn pack_frame_roundtrips_split() {
