@@ -44,6 +44,7 @@ pub mod sym_short;
 pub mod train;
 pub mod trie;
 pub mod vocab;
+pub mod wclass;
 
 pub use codec::{decode, decode_fixed3, encode, encode_fixed3, EncodeStats};
 pub use dict::Dictionary;

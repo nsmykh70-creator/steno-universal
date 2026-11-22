@@ -348,6 +348,194 @@ pub fn encode(input: &[u8], dict: &Dictionary) -> Result<(Vec<u8>, EncodeStats),
     Ok((frame, st))
 }
 
+/// Жадный разбор нормализованного текста словарём (длиннейшие совпадения,
+/// при отсутствии — один байт). Заполняет контекстные массивы классов
+/// (два предыдущих события) для каждой позиции и обучает модель классов.
+/// Концепция Stage 14: обучение на детерминированной жадной
+/// последовательности событий «токен/литерал».
+fn greedy_class_context(norm: &[u8], trie: &crate::trie::Trie) -> (Vec<u8>, Vec<u8>, crate::wclass::WcModel) {
+    use crate::wclass::{class_at, C_OTHER, WcModel};
+    let n = norm.len();
+    let mut ctx1 = vec![C_OTHER; n]; // класс события слева от позиции
+    let mut ctx2 = vec![C_OTHER; n]; // класс события через один слева
+    let mut seq: Vec<u8> = Vec::with_capacity(n / 2 + 8);
+    let (mut a, mut b) = (C_OTHER, C_OTHER);
+    let mut i = 0usize;
+    while i < n {
+        let (len, cls) = match trie.longest_at(norm, i) {
+            Some((len, _entry)) => (len, class_at(norm, i)),
+            None => (1usize, class_at(norm, i)),
+        };
+        for j in i..i + len {
+            ctx1[j] = b;
+            ctx2[j] = a;
+        }
+        seq.push(cls);
+        a = b;
+        b = cls;
+        i += len;
+    }
+    let mut model = WcModel::new();
+    model.train(&seq);
+    (ctx1, ctx2, model)
+}
+
+/// PS18: кодировщик с предсказанием классов письма. Тот же DP минимальной
+/// стоимости, что и `encode`, но в единицах 1/64 байта и с добавкой
+/// сюрпризала перехода классов (порядок 2, модель обучена на жадном разборе,
+/// `w` — множитель силы штрафа). Формат кадра и декодер не меняются.
+pub fn encode_ctx(
+    input: &[u8],
+    dict: &Dictionary,
+    w: u32,
+) -> Result<(Vec<u8>, EncodeStats), &'static str> {
+    let n = input.len();
+    if n > u32::MAX as usize / 4 {
+        return Err("вход слишком велик для DP-кодировщика");
+    }
+    let mut cost = vec![u64::MAX; n + 1];
+    let mut ops = vec![0u32; n + 1];
+    cost[n] = 0;
+    let trie = dict.trie();
+    let (norm, flags) = case_normalize(input);
+    let (ctx1, ctx2, model) = greedy_class_context(&norm, trie);
+    for i in (0..n).rev() {
+        let b = norm[i];
+        let mut best = u64::MAX;
+        let mut best_op = 0u32;
+        // штраф перехода классов для ребра, начинающегося в позиции i
+        let cls = crate::wclass::class_at(&norm, i);
+        let pen = (model.surprisal(ctx2[i], ctx1[i], cls) as u64) * w as u64;
+        if b < 0x80 {
+            if cost[i + 1] != u64::MAX {
+                best = 64 + pen + cost[i + 1];
+                best_op = pack(OP_ASCII, 0);
+            }
+        } else if cost[i + 1] != u64::MAX {
+            // одиночный RAW-байт дешевле литеральной цепочки из одного байта
+            best = 128 + pen + cost[i + 1];
+            best_op = pack(OP_RAW, 0);
+        }
+        if b >= 0x80 {
+            // литеральная цепочка выгодна с 3 байт (1 и 2 байта проигрывают RAW)
+            let max_l = RUN_MAX.min(n - i);
+            for l in 3..=max_l {
+                let next = cost[i + l];
+                if next == u64::MAX {
+                    continue;
+                }
+                let c = pen + (1 + varint_len(l as u64) as u64 + l as u64) * 64 + next;
+                if c < best {
+                    best = c;
+                    best_op = pack(OP_RUN, l as u32);
+                }
+            }
+        }
+        for (len, entry) in trie.matches_at(&norm, i) {
+            let fl = token_flag(&flags, &norm, i, len);
+            if fl == 0xFF {
+                continue; // внутри промежутка другой флаг — запись не восстановит регистр
+            }
+            let (lane, id) = unpack_entry(entry);
+            let next = cost[i + len];
+            if next == u64::MAX {
+                continue;
+            }
+            let c = pen + (fl as u64 + Dictionary::token_width(lane) as u64) * 64 + next;
+            // `<=`: при равной стоимости предпочитаем более длинное совпадение
+            if c <= best {
+                best = c;
+                best_op = pack(OP_TOKEN + lane as u32, id);
+            }
+        }
+        cost[i] = best;
+        ops[i] = best_op;
+    }
+    if n > 0 && cost[0] == u64::MAX {
+        return Err("DP не нашёл пути кодирования");
+    }
+    emit_frame(input, dict, &ops, &norm, &flags, n)
+}
+
+/// Эмиссия токенов по обратным указателям и сборка кадра (общая для
+/// статического DP и DP с классами). `norm`/`flags` должны быть вычислены
+/// на ПОЛНОМ входе тем же вызовом `case_normalize`, что и в DP.
+fn emit_frame(
+    input: &[u8],
+    dict: &Dictionary,
+    ops: &[u32],
+    norm: &[u8],
+    flags: &[u8],
+    n: usize,
+) -> Result<(Vec<u8>, EncodeStats), &'static str> {
+    let mut payload = Vec::with_capacity(n / 2 + 16);
+    let mut st = EncodeStats::default();
+    let mut i = 0usize;
+    while i < n {
+        let packed = ops[i];
+        let op = packed >> 29;
+        let arg = packed & ARG_MASK;
+        match op {
+            OP_ASCII => {
+                payload.push(input[i]);
+                i += 1;
+                st.ascii += 1;
+            }
+            OP_RUN => {
+                let l = arg as usize;
+                payload.push(TAG_RUN);
+                put_uvarint(l as u64, &mut payload);
+                payload.extend_from_slice(&input[i..i + l]);
+                i += l;
+                st.run += 1;
+                st.run_bytes += l as u64;
+            }
+            OP_RAW => {
+                payload.push(TAG_RAW);
+                payload.push(input[i]);
+                i += 1;
+                st.raw_byte += 1;
+            }
+        lane_op => {
+            let lane = (lane_op - OP_TOKEN) as usize;
+            let id = arg as u64;
+            let entry_len = dict.entry(lane, id).len();
+            // тот же расчёт флага, что и в DP: CAP/UPPER перед токеном
+            let fl = token_flag(flags, norm, i, entry_len);
+            if fl == 1 {
+                payload.push(TAG_CAP);
+            } else if fl == 2 {
+                payload.push(TAG_UPPER);
+            }
+            dict.encode_token(lane, id, &mut payload);
+            i += entry_len;
+                match lane {
+                    LANE_SYMBOL => st.symbol += 1,
+                    LANE_SHORT => st.short += 1,
+                    LANE_REGULAR => st.regular += 1,
+                    LANE_STRUCT => st.struct_ += 1,
+                    LANE_EXTENDED => st.extended += 1,
+                    _ => unreachable!("lane 0..4 проверяется при упаковке entry"),
+                }
+            }
+        }
+    }
+    // Сборка кадра: магия + обучаемый словарь + дайджест + длина входа + полезная нагрузка
+    let trained = dict.serialize_trained_frame();
+    let mut frame = Vec::with_capacity(MAGIC.len() + trained.len() + 9 + payload.len());
+    frame.extend_from_slice(MAGIC);
+    frame.extend_from_slice(&trained);
+    let digest = crate::dict::fnv1a64(&frame);
+    frame.extend_from_slice(&digest.to_le_bytes());
+    put_uvarint(n as u64, &mut frame);
+    frame.extend_from_slice(&payload);
+    st.payload = payload.len() as u64;
+    st.dict_bytes = trained.len() as u64;
+    st.frame = frame.len() as u64;
+    st.tokens = st.ascii + st.symbol + st.short + st.regular + st.struct_ + st.extended + st.run + st.raw_byte;
+    Ok((frame, st))
+}
+
 /// Декодер кадра: полная проверка формата, без паник, ошибки — `&'static str`.
 pub fn decode(frame: &[u8]) -> Result<Vec<u8>, &'static str> {
     if frame.len() < MAGIC.len() || &frame[..MAGIC.len()] != MAGIC {
@@ -765,6 +953,39 @@ fn payload_from_streams(ctrl: &[u8], data: &[u8]) -> Result<Vec<u8>, &'static st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------- PS18: кодирование с классами письма ----------------
+
+    #[test]
+    fn ps18_ctx_roundtrip_мультиязычный() {
+        let dict = case_dict();
+        let text = "АннаЛевин эхо окна, мама мыла раму. Hello world, 日本語のテキスト واللغة العربية กั มัน हिन्दी! АннаЭхо.".as_bytes();
+        for w in [0u32, 1, 2, 4] {
+            let (frame, st) = encode_ctx(text, &dict, w).expect("encode_ctx");
+            assert_eq!(decode(&frame).expect("decode"), text, "roundtrip w={w}");
+            assert!(st.frame > 0);
+        }
+    }
+
+    #[test]
+    fn ps18_ctx_детерминизм() {
+        let dict = case_dict();
+        let text = "Анна и Левин, окна и эхо. 日本 テスト كتب कर सकते हैं".as_bytes();
+        let (f1, _) = encode_ctx(text, &dict, 2).expect("encode_ctx 1");
+        let (f2, _) = encode_ctx(text, &dict, 2).expect("encode_ctx 2");
+        assert_eq!(f1, f2, "encode_ctx должен быть детерминированным");
+    }
+
+    #[test]
+    fn ps18_ctx_без_штрафа_совпадает_со_статикой() {
+        // w=0: сюрпризал не влияет на стоимость; масштаб ×64 сохраняет порядок
+        let dict = case_dict();
+        let text = "Анна Каренина, Левин и эхо рядом с окнами".as_bytes();
+        let (f_static, st_static) = encode(text, &dict).expect("encode");
+        let (f_ctx, st_ctx) = encode_ctx(text, &dict, 0).expect("encode_ctx");
+        assert_eq!(st_static.payload, st_ctx.payload, "w=0 обязан совпадать по payload");
+        assert_eq!(f_static.len(), f_ctx.len());
+    }
 
     /// Словарь с кириллическими словами в нижнем регистре + фразой-ловушкой.
     /// Слова кладутся в ОБУЧАЕМЫЕ слои: статические таблицы — константы

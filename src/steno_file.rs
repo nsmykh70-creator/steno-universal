@@ -156,6 +156,52 @@ fn encode_cmd(input: &str, outdir: &str, flags: &[String]) {
 
     fs::create_dir_all(outdir).expect("создание каталога вывода");
     let stem = file_stem(input);
+    // PS18: вариант с предсказанием классов письма (--wclass W, 0 = выкл)
+    let mut wclass_w = 0u32;
+    let mut ai = 0;
+    while ai < flags.len() {
+        if flags[ai] == "--wclass" {
+            wclass_w = flags.get(ai + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            ai += 2;
+        } else {
+            ai += 1;
+        }
+    }
+    if wclass_w > 0 {
+        let t = Instant::now();
+        let (frame_ctx, st_ctx) =
+            codec::encode_ctx(&raw, &trained, wclass_w).expect("кодирование с классами письма");
+        let enc_ctx_s = t.elapsed();
+        let t = Instant::now();
+        let dec_ctx = codec::decode(&frame_ctx).expect("декодер кадра с классами");
+        let dec_ctx_s = t.elapsed();
+        if dec_ctx != raw {
+            panic!("roundtrip кадра с классами письма не сошёлся");
+        }
+        fs::write(format!("{outdir}/{stem}.stuv_ctx"), &frame_ctx)
+            .expect("запись кадра с классами");
+        let delta = (frame_ctx.len() as f64 - frame_trained.len() as f64)
+            / frame_trained.len() as f64
+            * 100.0;
+        println!(
+            "RESULT3\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}",
+            stem,
+            raw.len(),
+            wclass_w,
+            frame_ctx.len(),
+            st_ctx.payload,
+            st_ctx.dict_bytes,
+            enc_ctx_s.as_secs_f64() * 1000.0,
+            dec_ctx_s.as_secs_f64() * 1000.0,
+            st_trained.frame,
+            delta
+        );
+        eprintln!(
+            "encode_ctx {stem}: w={wclass_w} кадр {} Б против trained {} Б (Δ {delta:+.2}%)",
+            frame_ctx.len(),
+            frame_trained.len()
+        );
+    }
     fs::write(format!("{outdir}/{stem}.stuv_static"), &frame_static).expect("запись кадра стат");
     fs::write(format!("{outdir}/{stem}.stuv_trained"), &frame_trained)
         .expect("запись кадра обуч");
