@@ -1,0 +1,15 @@
+[package]
+name = "steno-p7"
+version = "0.7.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Experimental adaptive multilingual text codec with joint token-cost optimization"
+license = "MIT"
+
+[lib]
+name = "steno_p7"
+path = "src/lib.rs"
+
+[[bin]]
+name = "steno-p7"
+path = "src/main.rs"
