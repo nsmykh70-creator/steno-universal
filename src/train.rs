@@ -36,7 +36,9 @@ pub struct TrainConfig {
 impl Default for TrainConfig {
     fn default() -> Self {
         TrainConfig {
-            max_train_chars: 1_000_000,
+            // словарь по умолчанию — 1 ГБ корпуса (PS16): файлы меньше окна
+            // обучаются целиком, большие — равномерными выборками
+            max_train_chars: 1 << 30,
             windows: 16,
             max_atoms: 10,
             min_phrase_bytes: 7,
@@ -150,6 +152,10 @@ pub fn syllabify(word: &str) -> Vec<String> {
     out
 }
 
+/// Защита памяти при корпусах до 1 ГБ: предел уникальных ключей счётчиков.
+/// При переполнении новые ключи не добавляются, счёт существующих продолжается.
+const MAX_UNIQUE_KEYS: usize = 4_000_000;
+
 fn count_window(text: &str, cfg: &TrainConfig, counts: &mut Counts) {
     let atoms = atomize(text);
     let n = atoms.len();
@@ -157,13 +163,22 @@ fn count_window(text: &str, cfg: &TrainConfig, counts: &mut Counts) {
         let (a, b) = (w[0], w[1]);
         let first = &text[a.0..a.1];
         let second = &text[b.0..b.1];
-        *counts.bigrams.entry((first.to_string(), second.to_string())).or_insert(0) += 1;
-        *counts.atoms.entry(first.to_string()).or_insert(0) += 1;
+        let bk = (first.to_string(), second.to_string());
+        if counts.bigrams.len() < MAX_UNIQUE_KEYS || counts.bigrams.contains_key(&bk) {
+            *counts.bigrams.entry(bk).or_insert(0) += 1;
+        }
+        let ak = first.to_string();
+        if counts.atoms.len() < MAX_UNIQUE_KEYS || counts.atoms.contains_key(&ak) {
+            *counts.atoms.entry(ak).or_insert(0) += 1;
+        }
         counts.total_bigrams += 1;
     }
     if n > 0 {
         let last = atoms[n - 1];
-        *counts.atoms.entry(text[last.0..last.1].to_string()).or_insert(0) += 1;
+        let lk = text[last.0..last.1].to_string();
+        if counts.atoms.len() < MAX_UNIQUE_KEYS || counts.atoms.contains_key(&lk) {
+            *counts.atoms.entry(lk).or_insert(0) += 1;
+        }
     }
     for width in 2..=cfg.max_atoms.min(n) {
         for i in 0..=(n - width) {
@@ -177,29 +192,29 @@ fn count_window(text: &str, cfg: &TrainConfig, counts: &mut Counts) {
             if phrase.len() > crate::dict::ENTRY_MAX_LEN {
                 continue;
             }
+            if counts.phrases.len() >= MAX_UNIQUE_KEYS && !counts.phrases.contains_key(phrase) {
+                continue;
+            }
             *counts.phrases.entry(phrase.to_string()).or_insert(0) += 1;
         }
     }
 }
 
-/// Суммарная PMI-поддержка предшественников первого атома кандидата
-/// (упрощение P5: только ранжирование пула, никогда не гейт приёма).
-fn pmi_profile(first: &str, counts: &Counts) -> f64 {
-    let mut sum = 0.0f64;
+/// Суммарная PMI-поддержка по первому атому, предвычисленная одним проходом
+/// по биграммам (PS16: раньше сканировалась вся карта на каждого кандидата —
+/// O(кандидаты × биграммы) не масштабировалась на корпус 1 ГБ).
+fn pmi_sums(counts: &Counts) -> std::collections::HashMap<&str, f64> {
+    let mut out: std::collections::HashMap<&str, f64> = Default::default();
+    let total = counts.total_bigrams.max(1) as f64;
     for (pair, joint) in &counts.bigrams {
-        if pair.1 != first {
-            continue;
-        }
         let a = counts.atoms.get(&pair.0).copied().unwrap_or(1) as f64;
         let b = counts.atoms.get(&pair.1).copied().unwrap_or(1) as f64;
-        let j = *joint as f64;
-        let total = counts.total_bigrams.max(1) as f64;
-        let ratio = j * total / (a * b);
+        let ratio = *joint as f64 * total / (a * b);
         if ratio > 1.0 {
-            sum += j * ratio.log2();
+            *out.entry(pair.1.as_str()).or_insert(0.0) += *joint as f64 * ratio.log2();
         }
     }
-    sum
+    out
 }
 
 struct Candidate {
@@ -259,6 +274,7 @@ pub fn train(input: &[u8], base: &Dictionary, cfg: &TrainConfig) -> Result<Dicti
         .flat_map(|l| l.iter().map(|s| s.to_string()))
         .collect();
     let mut candidates: Vec<Candidate> = Vec::new();
+    let psums = pmi_sums(&counts);
     for (s, c) in &counts.atoms {
         if *c < cfg.min_count as u64 {
             continue;
@@ -281,7 +297,7 @@ pub fn train(input: &[u8], base: &Dictionary, cfg: &TrainConfig) -> Result<Dicti
         if gross <= 0.0 {
             continue;
         }
-        let ci = if is_symbol { 0.0 } else { pmi_profile(s, &counts) };
+        let ci = if is_symbol { 0.0 } else { psums.get(s.as_str()).copied().unwrap_or(0.0) };
         let score = gross + (gross * 0.35).min(ci * 0.05);
         covered.insert(s.clone());
         candidates.push(Candidate { s: s.clone(), lane, score });
@@ -297,7 +313,7 @@ pub fn train(input: &[u8], base: &Dictionary, cfg: &TrainConfig) -> Result<Dicti
             continue;
         }
         let first: String = s.chars().next().unwrap_or('\0').to_string();
-        let ci = pmi_profile(&first, &counts);
+        let ci = psums.get(first.as_str()).copied().unwrap_or(0.0);
         let score = gross + (gross * 0.35).min(ci * 0.05);
         candidates.push(Candidate { s: s.clone(), lane, score });
     }

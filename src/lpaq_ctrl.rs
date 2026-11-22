@@ -1,11 +1,15 @@
-//! CM-кодер класса lpaq/zpaq для ctrl-потока (эксперимент PS11).
+//! CM-кодер класса lpaq/zpaq для ctrl-потока (cmz2, PS16).
 //!
 //! Бинарное контекстное смешивание: каждый бит байта предсказывают модели —
-//! порядок 0 (частичный байт), хешированные порядки 1–6 и match-модель
-//! с длинными контекстами (хеш последних 6 байтов → позиция в истории;
-//! рабочий контекст — сотни и тысячи байтов). Предсказания смешиваются
-//! логистическим миксером (SGD-дообучение весов по битам) и калибруются
-//! двумя APM-стадиями. Кодирование — бинарный range coder (общий с frec).
+//! порядок 0 (частичный байт), хешированные порядки 1–3 и match-модель
+//! с длинными контекстами (хеш последних 8 байтов → двухслотовый бакет
+//! позиций в истории; второй слот хранит предпоследнее вхождение, поэтому
+//! дальние повторы находятся даже при перезаписи ближнего слота).
+//! Порядки 4–6 сняты ради скорости (цель PS16): 5 предсказаний на бит
+//! вместо 8, индексы контекстов кэшируются между predict и update.
+//! История матча не ограничена окном (позиции u32 — до 4 ГБ).
+//! Предсказания смешиваются логистическим миксером и калибруются двумя
+//! APM-стадиями. Кодирование — бинарный range coder (общий с frec).
 //! Декодер повторяет цепочку моделей по декодированным битам; roundtrip
 //! проверяется внутри cmz_encode.
 
@@ -13,12 +17,18 @@ use crate::dict::{get_uvarint, put_uvarint};
 use crate::frec::{RcDec, RcEnc};
 
 const COUNT_LIMIT: u32 = 255;
-const MATCH_MINL: usize = 6;
-const MATCH_MAXLEN: usize = 255;
-/// размер хеш-таблицы позиций match-модели
+const MATCH_MINL: usize = 8;
+const MATCH_MAXLEN: usize = 65535;
+/// размер хеш-таблицы позиций match-модели (ключей; у каждого 2 слота)
 const MTAB_BITS: u32 = 23;
 /// размер таблиц счётчиков хешированных контекстов
-const CTAB_BITS: u32 = 21;
+const CTAB_BITS: u32 = 22;
+/// число хешированных порядков: 1, 2, 3
+const NORD: usize = 3;
+/// число входов миксера: порядок 0 + NORD контекстов + матч
+const NIN: usize = NORD + 2;
+/// версия файлового формата cmz
+pub const CMZ_VERSION: u64 = 2;
 
 /// Адаптивный счётчик: 12-битная вероятность + счётчик наблюдений.
 struct Ctr {
@@ -72,10 +82,10 @@ impl Apm {
     }
 }
 
-/// Логистический миксер: 8 входов, 16 наборов весов (бит × режим матча).
+/// Логистический миксер: NIN входов, 16 наборов весов (бит × режим матча).
 struct Mixer {
     w: Vec<i32>,
-    inputs: [i32; 8],
+    inputs: [i32; NIN],
     set: usize,
     p: u32,
 }
@@ -83,19 +93,19 @@ struct Mixer {
 impl Mixer {
     fn new() -> Self {
         // порядок 0 — сильный калибратор, контексты и матч — умеренно
-        let mut w = vec![0i32; 16 * 8];
+        let mut w = vec![0i32; 16 * NIN];
         for s in 0..16 {
-            w[s * 8] = 3 << 15;
-            for k in 1..8 {
-                w[s * 8 + k] = 1 << 15;
+            w[s * NIN] = 3 << 15;
+            for k in 1..NIN {
+                w[s * NIN + k] = 1 << 15;
             }
         }
-        Mixer { w, inputs: [0; 8], set: 0, p: 2048 }
+        Mixer { w, inputs: [0; NIN], set: 0, p: 2048 }
     }
     fn mix(&mut self) {
-        let base = self.set * 8;
+        let base = self.set * NIN;
         let mut dot = 0i64;
-        for k in 0..8 {
+        for k in 0..NIN {
             dot += self.w[base + k] as i64 * self.inputs[k] as i64;
         }
         let d = (dot >> 16).clamp(-2047, 2047) as i32;
@@ -103,8 +113,8 @@ impl Mixer {
     }
     fn update(&mut self, bit: u32) {
         let err = (bit << 12) as i64 - self.p as i64;
-        let base = self.set * 8;
-        for k in 0..8 {
+        let base = self.set * NIN;
+        for k in 0..NIN {
             let dw = (self.inputs[k] as i64 * err * 10) >> 16;
             self.w[base + k] = (self.w[base + k] as i64 + dw).clamp(-(4 << 20), 4 << 20) as i32;
         }
@@ -145,9 +155,11 @@ fn build_rate() -> [u32; 256] {
     r
 }
 
-/// Match-модель: хеш последних 6 байтов → позиция последнего вхождения.
+/// Match-модель: хеш последних 8 байтов → бакет из 2 позиций.
+/// Слот 0 — последнее вхождение, слот 1 — предпоследнее: дальний повтор
+/// находится, даже если ближний слот перезаписан частым коротким контекстом.
 struct MatchModel {
-    table: Vec<u32>,
+    table: Vec<[u32; 2]>,
     mask: usize,
     /// позиция байта-продолжения в истории (0 = нет активного матча)
     pos: usize,
@@ -156,9 +168,14 @@ struct MatchModel {
 
 impl MatchModel {
     fn new() -> Self {
-        MatchModel { table: vec![0u32; 1 << MTAB_BITS], mask: (1 << MTAB_BITS) - 1, pos: 0, len: 0 }
+        MatchModel {
+            table: vec![[0u32; 2]; 1 << MTAB_BITS],
+            mask: (1 << MTAB_BITS) - 1,
+            pos: 0,
+            len: 0,
+        }
     }
-    /// Граница байта i: обновить таблицу и найти матч по 6-байтовому контексту.
+    /// Граница байта i: обновить таблицу и найти матч по 8-байтовому контексту.
     fn boundary(&mut self, buf: &[u8], i: usize, hctx: &mut u64) {
         *hctx = 0;
         self.pos = 0;
@@ -170,15 +187,21 @@ impl MatchModel {
             }
             *hctx = h;
             let idx = (h as usize) & self.mask;
-            let cand = self.table[idx] as usize;
-            self.table[idx] = i as u32;
-            if cand > 0
-                && cand + MATCH_MINL < i
-                && buf[cand..cand + MATCH_MINL] == buf[i - MATCH_MINL..i]
-            {
-                self.pos = cand + MATCH_MINL;
-                self.len = MATCH_MINL;
+            // сначала валидация кандидатов (старые позиции), потом запись новой;
+            // строгий знак: pos обязан указывать на уже известный байт
+            for slot in 0..2 {
+                let cand = self.table[idx][slot] as usize;
+                if cand > 0
+                    && cand + MATCH_MINL < i
+                    && buf[cand..cand + MATCH_MINL] == buf[i - MATCH_MINL..i]
+                {
+                    self.pos = cand + MATCH_MINL;
+                    self.len = MATCH_MINL;
+                    break;
+                }
             }
+            self.table[idx][1] = self.table[idx][0];
+            self.table[idx][0] = i as u32;
         }
     }
     /// Обновление по факту бита: несовпадение ломает матч, полный байт продлевает.
@@ -208,11 +231,11 @@ fn hash_ctx(hprev: u64, partial: u32, salt: u32) -> usize {
 }
 
 struct CmState {
-    hc: [u64; 7],
+    hc: [u64; NORD + 1],
     stretch: [i32; 4096],
     rate: [u32; 256],
     t0: Vec<Ctr>,
-    /// таблицы порядков 1..6 (индекс k-1)
+    /// таблицы порядков 1..=NORD (индекс k-1)
     th: Vec<Vec<Ctr>>,
     /// таблица match-модели
     tm: Vec<Ctr>,
@@ -221,23 +244,29 @@ struct CmState {
     mixer: Mixer,
     apm1: Apm,
     apm2: Apm,
+    /// кэш индексов контекстов текущего бита (predict → update без пере-хеша)
+    li: [usize; NORD],
+    /// кэш индекса match-счётчика текущего бита
+    lm: usize,
 }
 
 impl CmState {
     fn new() -> Self {
         let n = 1usize << CTAB_BITS;
         CmState {
-            hc: [0; 7],
+            hc: [0; NORD + 1],
             stretch: build_stretch(),
             rate: build_rate(),
             t0: (0..256).map(|_| Ctr::new()).collect(),
-            th: (0..6).map(|_| (0..n).map(|_| Ctr::new()).collect()).collect(),
+            th: (0..NORD).map(|_| (0..n).map(|_| Ctr::new()).collect()).collect(),
             tm: (0..n).map(|_| Ctr::new()).collect(),
             mm: MatchModel::new(),
             hctx: 0,
             mixer: Mixer::new(),
             apm1: Apm::new(256),
             apm2: Apm::new(1 << 15),
+            li: [0; NORD],
+            lm: 0,
         }
     }
     #[inline]
@@ -253,18 +282,21 @@ impl CmState {
         let st = &self.stretch;
         let p0 = self.t0[c0 as usize].pr();
         self.mixer.inputs[0] = stretch_of(p0, st);
-        for k in 1..=6usize {
-            let idx = hash_ctx(self.hc[k], c0, k as u32) & ((1 << CTAB_BITS) - 1);
-            let pk = self.th[k - 1][idx].pr();
-            self.mixer.inputs[k] = stretch_of(pk, st);
+        for k in 0..NORD {
+            let idx = hash_ctx(self.hc[k + 1], c0, (k + 1) as u32) & ((1 << CTAB_BITS) - 1);
+            self.li[k] = idx;
+            let pk = self.th[k][idx].pr();
+            self.mixer.inputs[k + 1] = stretch_of(pk, st);
         }
         let mut pm = 2048u32;
+        self.lm = 0;
         if self.mm.pos != 0 {
             let pb = buf[self.mm.pos] as u32;
             let idx = self.match_idx(c0, pb);
+            self.lm = idx;
             pm = self.tm[idx].pr();
         }
-        self.mixer.inputs[7] = stretch_of(pm, st);
+        self.mixer.inputs[NIN - 1] = stretch_of(pm, st);
         self.mixer.set = j * 2 + if self.mm.pos != 0 { 1 } else { 0 };
         self.mixer.mix();
         let mut p = self.mixer.p;
@@ -272,17 +304,14 @@ impl CmState {
         p = self.apm2.apply(hash_ctx(self.hc[1], c0, 99) & ((1 << 15) - 1), p, &self.rate);
         p
     }
-    /// Обновление всех моделей по факту бита.
+    /// Обновление всех моделей по факту бита (индексы кэшированы predict'ом).
     fn update(&mut self, j: usize, c0: u32, bit: u32, buf: &[u8], i_next: usize) {
         self.t0[c0 as usize].upd(bit, &self.rate);
-        for k in 1..=6usize {
-            let idx = hash_ctx(self.hc[k], c0, k as u32) & ((1 << CTAB_BITS) - 1);
-            self.th[k - 1][idx].upd(bit, &self.rate);
+        for k in 0..NORD {
+            self.th[k][self.li[k]].upd(bit, &self.rate);
         }
         if self.mm.pos != 0 {
-            let pb = buf[self.mm.pos] as u32;
-            let idx = self.match_idx(c0, pb);
-            self.tm[idx].upd(bit, &self.rate);
+            self.tm[self.lm].upd(bit, &self.rate);
         }
         self.mixer.update(bit);
         self.mm.bit_update(buf, j, bit, i_next);
@@ -290,7 +319,7 @@ impl CmState {
     fn byte_done(&mut self, b: u8) {
         let old = self.hc;
         self.hc[0] = b as u64;
-        for k in 1..=6usize {
+        for k in 1..=NORD {
             self.hc[k] = old[k - 1].wrapping_mul(0x9E3779B97F4A7C15)
                 ^ (b as u64).wrapping_add(k as u64);
         }
@@ -333,20 +362,25 @@ fn cmz_encode_raw(ctrl: &[u8]) -> Vec<u8> {
     rc.finish()
 }
 
-/// Файловый формат cmz: uvarint(длина исходного потока) + CM-поток.
-/// Длина нужна декодеру: CM-поток сам по себе её не несёт.
+/// Файловый формат cmz: uvarint(длина исходного потока) + uvarint(версия) +
+/// CM-поток. Длина нужна декодеру, версия — гарантия совместимости моделей.
 pub fn cmz_encode_file(ctrl: &[u8]) -> Result<Vec<u8>, &'static str> {
     let body = cmz_encode(ctrl)?;
-    let mut out = Vec::with_capacity(body.len() + 5);
+    let mut out = Vec::with_capacity(body.len() + 8);
     put_uvarint(ctrl.len() as u64, &mut out);
+    put_uvarint(CMZ_VERSION, &mut out);
     out.extend_from_slice(&body);
     Ok(out)
 }
 
-/// Декодирование файлового cmz-формата (длина читается из заголовка).
+/// Декодирование файлового cmz-формата (длина и версия читаются из заголовка).
 pub fn cmz_decode_file(data: &[u8]) -> Result<Vec<u8>, &'static str> {
     let mut pos = 0usize;
     let n = get_uvarint(data, &mut pos)? as usize;
+    let ver = get_uvarint(data, &mut pos)?;
+    if ver != CMZ_VERSION {
+        return Err("cmz: неизвестная версия формата");
+    }
     if n == 0 || pos >= data.len() {
         return Err("cmz: пустой или неверный заголовок");
     }
