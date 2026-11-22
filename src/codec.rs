@@ -471,55 +471,84 @@ pub fn split_streams(frame: &[u8]) -> Result<StreamSplit, &'static str> {
 
 /// Обратная сборка потока токенов из ctrl/data и полное восстановление кадра.
 pub fn recompose_frame(frame: &[u8], split: &StreamSplit) -> Result<Vec<u8>, &'static str> {
-    let mut payload = Vec::with_capacity(split.ctrl.len() + split.data.len());
-    let (mut ci, mut di) = (0usize, 0usize);
-    while ci < split.ctrl.len() {
-        let b = split.ctrl[ci];
-        ci += 1;
-        if b == 0x00 {
-            let k = get_uvarint(&split.ctrl, &mut ci)? as usize;
-            if di + k > split.data.len() {
-                return Err("поток данных исчерпан на ASCII-серии");
-            }
-            payload.extend_from_slice(&split.data[di..di + k]);
-            di += k;
-        } else if b == TAG_RUN {
-            let l = get_uvarint(&split.ctrl, &mut ci)? as usize;
-            if di + l > split.data.len() {
-                return Err("поток данных исчерпан на RUN-цепочке");
-            }
-            payload.push(TAG_RUN);
-            put_uvarint(l as u64, &mut payload);
-            payload.extend_from_slice(&split.data[di..di + l]);
-            di += l;
-        } else if b == TAG_RAW {
-            if di >= split.data.len() {
-                return Err("поток данных исчерпан на RAW-байте");
-            }
-            payload.push(TAG_RAW);
-            payload.push(split.data[di]);
-            di += 1;
-        } else {
-            let width = token_width_from_lead(b);
-            if ci - 1 + width > split.ctrl.len() {
-                return Err("управляющий поток исчерпан на токене");
-            }
-            payload.extend_from_slice(&split.ctrl[ci - 1..ci - 1 + width]);
-            ci += width - 1;
-        }
-    }
-    if di != split.data.len() {
-        return Err("поток данных не израсходован полностью");
-    }
+    let payload = payload_from_streams(&split.ctrl, &split.data)?;
     let mut out = Vec::with_capacity(split.header_len + payload.len());
     out.extend_from_slice(&frame[..split.header_len]);
     out.extend_from_slice(&payload);
     Ok(out)
 }
 
+/// Сборка кадра из отдельных частей: байты заголовка + ctrl + data.
+/// Обратная операция к split_streams (заголовок берётся из архива).
+pub fn pack_frame(header: &[u8], ctrl: &[u8], data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let payload = payload_from_streams(ctrl, data)?;
+    let mut out = Vec::with_capacity(header.len() + payload.len());
+    out.extend_from_slice(header);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+/// Интерливинг ctrl/data в поток токенов кадра (общая логика
+/// для recompose_frame и pack_frame).
+fn payload_from_streams(ctrl: &[u8], data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let mut payload = Vec::with_capacity(ctrl.len() + data.len());
+    let (mut ci, mut di) = (0usize, 0usize);
+    while ci < ctrl.len() {
+        let b = ctrl[ci];
+        ci += 1;
+        if b == 0x00 {
+            let k = get_uvarint(ctrl, &mut ci)? as usize;
+            if di + k > data.len() {
+                return Err("поток данных исчерпан на ASCII-серии");
+            }
+            payload.extend_from_slice(&data[di..di + k]);
+            di += k;
+        } else if b == TAG_RUN {
+            let l = get_uvarint(ctrl, &mut ci)? as usize;
+            if di + l > data.len() {
+                return Err("поток данных исчерпан на RUN-цепочке");
+            }
+            payload.push(TAG_RUN);
+            put_uvarint(l as u64, &mut payload);
+            payload.extend_from_slice(&data[di..di + l]);
+            di += l;
+        } else if b == TAG_RAW {
+            if di >= data.len() {
+                return Err("поток данных исчерпан на RAW-байте");
+            }
+            payload.push(TAG_RAW);
+            payload.push(data[di]);
+            di += 1;
+        } else {
+            let width = token_width_from_lead(b);
+            if ci - 1 + width > ctrl.len() {
+                return Err("управляющий поток исчерпан на токене");
+            }
+            payload.extend_from_slice(&ctrl[ci - 1..ci - 1 + width]);
+            ci += width - 1;
+        }
+    }
+    if di != data.len() {
+        return Err("поток данных не израсходован полностью");
+    }
+    Ok(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_frame_roundtrips_split() {
+        let d = Dictionary::static_only();
+        let src = "проверка сборки кадра из частей: abc 123, ещё текст; словарь и прогоны.".repeat(4);
+        let (frame, _) = encode(src.as_bytes(), &d).unwrap();
+        let split = split_streams(&frame).unwrap();
+        let packed =
+            pack_frame(&frame[..split.header_len], &split.ctrl, &split.data).unwrap();
+        assert_eq!(packed, frame, "pack_frame обязан восстановить кадр точно");
+        assert_eq!(decode(&packed).unwrap(), src.as_bytes());
+    }
 
     #[test]
     fn empty_input_roundtrip() {

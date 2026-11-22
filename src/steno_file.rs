@@ -4,12 +4,17 @@
 //! Использование:
 //!   steno_file encode <вход> <каталог_вывода>  — кадры + восстановленные файлы
 //!   steno_file decode <кадр> <выход>           — кадр → исходные байты
+//!   steno_file cmz <поток> <каталог>           — CM-сжатие потока (файловый формат с длиной)
+//!   steno_file cmz-decode <файл.cmz> <выход>   — CM-распаковка потока
+//!   steno_file pack <hdr> <ctrl> <data> <кадр> — сборка кадра из частей архива
+//!   steno_file unpack <каталог> <stem> <выход> — полная распаковка архива пайплайна
 
 use std::fs;
 use std::time::Instant;
 
 use steno_uv::codec;
 use steno_uv::dict::Dictionary;
+use steno_uv::lpaq_ctrl;
 use steno_uv::train::{self, TrainConfig};
 
 fn main() {
@@ -20,8 +25,11 @@ fn main() {
         Some("dumpstreams") if args.len() >= 4 => dumpstreams_cmd(&args[2], &args[3]),
         Some("frec") if args.len() >= 4 => frec_cmd(&args[2], &args[3], &args[4..]),
         Some("cmz") if args.len() >= 4 => cmz_cmd(&args[2], &args[3]),
+        Some("cmz-decode") if args.len() >= 4 => cmz_decode_cmd(&args[2], &args[3]),
+        Some("pack") if args.len() >= 6 => pack_cmd(&args[2], &args[3], &args[4], &args[5]),
+        Some("unpack") if args.len() >= 5 => unpack_cmd(&args[2], &args[3], &args[4]),
         _ => {
-            eprintln!("использование: steno_file encode <вход> <каталог> [--cap N] [--min-count M] [--chars C] [--syll K] | decode <кадр> <выход> | dumpstreams <кадр> <каталог> | frec <ctrl> <каталог> [--order0] | cmz <ctrl> <каталог>");
+            eprintln!("использование: steno_file encode <вход> <каталог> [--cap N] [--min-count M] [--chars C] [--syll K] | decode <кадр> <выход> | dumpstreams <кадр> <каталог> | frec <ctrl> <каталог> [--order0] | cmz <поток> <каталог> | cmz-decode <файл.cmz> <выход> | pack <hdr> <ctrl> <data> <кадр> | unpack <каталог> <stem> <выход>");
             std::process::exit(2);
         }
     }
@@ -235,21 +243,100 @@ fn frec_cmd(ctrl_path: &str, outdir: &str, flags: &[String]) {
 fn cmz_cmd(ctrl_path: &str, outdir: &str) {
     let ctrl = fs::read(ctrl_path).expect("чтение ctrl");
     let t0 = Instant::now();
-    let cmz = steno_uv::lpaq_ctrl::cmz_encode(&ctrl).expect("cmz кодирование");
+    // файловый формат: uvarint(длина) + CM-поток — длина нужна декодеру
+    let cmz = lpaq_ctrl::cmz_encode_file(&ctrl).expect("cmz кодирование");
     let dt = t0.elapsed();
     fs::create_dir_all(outdir).expect("создание каталога вывода");
-    let stem = file_stem(ctrl_path);
-    let stem = match stem.rsplit_once('.') {
-        Some((base, tag)) if tag == "ctrl" => base.to_string(),
-        _ => stem,
-    };
-    fs::write(format!("{outdir}/{stem}.cmz"), &cmz).expect("запись cmz");
-    println!("RESULT4\t{}\t{}\t{}\t{}", stem, ctrl.len(), cmz.len(), dt.as_secs_f64());
+    // имя входа целиком (677647.ctrl → 677647.ctrl.cmz), иначе оба потока
+    // пишут в один файл: file_stem съедает тег потока
+    let name = std::path::Path::new(ctrl_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("имя файла потока")
+        .to_string();
+    fs::write(format!("{outdir}/{name}.cmz"), &cmz).expect("запись cmz");
+    println!("RESULT4\t{}\t{}\t{}\t{}", name, ctrl.len(), cmz.len(), dt.as_secs_f64());
     eprintln!(
-        "cmz {stem}: {} Б → {} Б ({:.2}×, {:.1} c)",
+        "cmz {name}: {} Б → {} Б ({:.2}×, {:.1} c)",
         ctrl.len(),
         cmz.len(),
         ctrl.len() as f64 / cmz.len() as f64,
         dt.as_secs_f64()
+    );
+}
+
+/// CM-распаковка файлового формата cmz (uvarint-длина + CM-поток).
+fn cmz_decode_cmd(cmz_path: &str, output: &str) {
+    let data = fs::read(cmz_path).expect("чтение cmz");
+    let t0 = Instant::now();
+    let out = lpaq_ctrl::cmz_decode_file(&data).expect("cmz декодирование");
+    let dt = t0.elapsed();
+    fs::write(output, &out).expect("запись распакованного потока");
+    println!(
+        "RESULT5\t{}\t{}\t{}\t{}",
+        cmz_path,
+        data.len(),
+        out.len(),
+        dt.as_secs_f64()
+    );
+    eprintln!(
+        "cmz-decode {}: {} Б → {} Б ({:.1} c)",
+        cmz_path,
+        data.len(),
+        out.len(),
+        dt.as_secs_f64()
+    );
+}
+
+/// Сборка кадра из частей архива (заголовок + ctrl + data) с контролем декодером.
+fn pack_cmd(hdr_path: &str, ctrl_path: &str, data_path: &str, output: &str) {
+    let hdr = fs::read(hdr_path).expect("чтение заголовка");
+    let ctrl = fs::read(ctrl_path).expect("чтение ctrl");
+    let data = fs::read(data_path).expect("чтение data");
+    let t0 = Instant::now();
+    let frame = codec::pack_frame(&hdr, &ctrl, &data).expect("сборка кадра");
+    codec::decode(&frame).expect("контрольное декодирование собранного кадра");
+    let dt = t0.elapsed();
+    fs::write(output, &frame).expect("запись кадра");
+    println!(
+        "RESULT6\t{}\t{}\t{}\t{}",
+        output,
+        frame.len(),
+        dt.as_secs_f64(),
+        hdr.len() + ctrl.len() + data.len()
+    );
+    eprintln!(
+        "pack: {} + {} + {} Б → кадр {} Б ({:.1} c)",
+        hdr.len(),
+        ctrl.len(),
+        data.len(),
+        frame.len(),
+        dt.as_secs_f64()
+    );
+}
+
+/// Полная распаковка архива пайплайна: <каталог>/<stem>.hdr + .ctrl.cmz + .data.cmz.
+fn unpack_cmd(dir: &str, stem: &str, output: &str) {
+    let t_all = Instant::now();
+    let hdr = fs::read(format!("{dir}/{stem}.hdr")).expect("чтение заголовка архива");
+    let ctrl_c = fs::read(format!("{dir}/{stem}.ctrl.cmz")).expect("чтение ctrl.cmz");
+    let data_c = fs::read(format!("{dir}/{stem}.data.cmz")).expect("чтение data.cmz");
+    let ctrl = lpaq_ctrl::cmz_decode_file(&ctrl_c).expect("CM-декодирование ctrl");
+    let data = lpaq_ctrl::cmz_decode_file(&data_c).expect("CM-декодирование data");
+    let frame = codec::pack_frame(&hdr, &ctrl, &data).expect("сборка кадра");
+    let raw = codec::decode(&frame).expect("декодирование кадра");
+    fs::write(output, &raw).expect("запись исходного файла");
+    println!(
+        "RESULT7\t{}\t{}\t{}\t{}",
+        output,
+        raw.len(),
+        hdr.len() + ctrl_c.len() + data_c.len(),
+        t_all.elapsed().as_secs_f64()
+    );
+    eprintln!(
+        "unpack {stem}: {} Б из архива {} Б ({:.1} c)",
+        raw.len(),
+        hdr.len() + ctrl_c.len() + data_c.len(),
+        t_all.elapsed().as_secs_f64()
     );
 }

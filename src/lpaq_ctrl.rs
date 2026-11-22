@@ -9,6 +9,7 @@
 //! Декодер повторяет цепочку моделей по декодированным битам; roundtrip
 //! проверяется внутри cmz_encode.
 
+use crate::dict::{get_uvarint, put_uvarint};
 use crate::frec::{RcDec, RcEnc};
 
 const COUNT_LIMIT: u32 = 255;
@@ -332,9 +333,28 @@ fn cmz_encode_raw(ctrl: &[u8]) -> Vec<u8> {
     rc.finish()
 }
 
+/// Файловый формат cmz: uvarint(длина исходного потока) + CM-поток.
+/// Длина нужна декодеру: CM-поток сам по себе её не несёт.
+pub fn cmz_encode_file(ctrl: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let body = cmz_encode(ctrl)?;
+    let mut out = Vec::with_capacity(body.len() + 5);
+    put_uvarint(ctrl.len() as u64, &mut out);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Декодирование файлового cmz-формата (длина читается из заголовка).
+pub fn cmz_decode_file(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let mut pos = 0usize;
+    let n = get_uvarint(data, &mut pos)? as usize;
+    if n == 0 || pos >= data.len() {
+        return Err("cmz: пустой или неверный заголовок");
+    }
+    cmz_decode(&data[pos..], n)
+}
+
 /// Декодирование CM-потока (модели повторяют ход кодера).
-pub fn cmz_decode(data: &[u8], n: usize) -> Result<Vec<u8>, &'static str> {
-    let mut st = CmState::new();
+pub fn cmz_decode(data: &[u8], n: usize) -> Result<Vec<u8>, &'static str> {    let mut st = CmState::new();
     let mut rc = RcDec::new(data);
     let mut buf: Vec<u8> = Vec::with_capacity(n);
     for _ in 0..n {
