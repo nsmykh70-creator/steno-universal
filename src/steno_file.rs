@@ -26,10 +26,12 @@ fn main() {
         Some("frec") if args.len() >= 4 => frec_cmd(&args[2], &args[3], &args[4..]),
         Some("cmz") if args.len() >= 4 => cmz_cmd(&args[2], &args[3]),
         Some("cmz-decode") if args.len() >= 4 => cmz_decode_cmd(&args[2], &args[3]),
+        Some("cmz-frame") if args.len() >= 4 => cmz_frame_cmd(&args[2], &args[3]),
+        Some("cmz-frame-decode") if args.len() >= 4 => cmz_frame_decode_cmd(&args[2], &args[3]),
         Some("pack") if args.len() >= 6 => pack_cmd(&args[2], &args[3], &args[4], &args[5]),
         Some("unpack") if args.len() >= 5 => unpack_cmd(&args[2], &args[3], &args[4]),
         _ => {
-            eprintln!("использование: steno_file encode <вход> <каталог> [--cap N] [--min-count M] [--chars C] [--syll K] | decode <кадр> <выход> | dumpstreams <кадр> <каталог> | frec <ctrl> <каталог> [--order0] | cmz <поток> <каталог> | cmz-decode <файл.cmz> <выход> | pack <hdr> <ctrl> <data> <кадр> | unpack <каталог> <stem> <выход>");
+            eprintln!("использование: steno_file encode <вход> <каталог> [--cap N] [--min-count M] [--chars C] [--syll K] | decode <кадр> <выход> | dumpstreams <кадр> <каталог> | frec <ctrl> <каталог> [--order0] | cmz <поток> <каталог> | cmz-decode <файл.cmz> <выход> | cmz-frame <кадр> <каталог> | cmz-frame-decode <файл.frame.cmz> <выход> | pack <hdr> <ctrl> <data> <кадр> | unpack <каталог> <stem> <выход>");
             std::process::exit(2);
         }
     }
@@ -323,6 +325,62 @@ fn cmz_decode_cmd(cmz_path: &str, output: &str) {
         cmz_path,
         data.len(),
         out.len(),
+        dt.as_secs_f64()
+    );
+}
+
+/// CM-кодирование кадра ЦЕЛИКОМ (PS19): один поток hdr+payload позволяет
+/// энтропийному кодеру находить кросс-совпадения «словарь ↔ payload»
+/// (словарные записи повторяются в литеральных данных), чего нет при
+/// раздельном сжатии потоков. Roundtrip проверяется внутри cmz_encode_file.
+fn cmz_frame_cmd(frame_path: &str, outdir: &str) {
+    let frame = fs::read(frame_path).expect("чтение кадра");
+    let t0 = Instant::now();
+    let cmz = lpaq_ctrl::cmz_encode_file(&frame).expect("cmz-кадр кодирование");
+    let dt = t0.elapsed();
+    fs::create_dir_all(outdir).expect("создание каталога вывода");
+    let name = std::path::Path::new(frame_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("имя файла кадра")
+        .to_string();
+    fs::write(format!("{outdir}/{name}.cmz"), &cmz).expect("запись cmz-кадра");
+    println!(
+        "RESULT7\t{}\t{}\t{}\t{}",
+        name,
+        frame.len(),
+        cmz.len(),
+        dt.as_secs_f64()
+    );
+    eprintln!(
+        "cmz-frame {name}: {} Б → {} Б ({:.2}×, {:.1} c)",
+        frame.len(),
+        cmz.len(),
+        frame.len() as f64 / cmz.len() as f64,
+        dt.as_secs_f64()
+    );
+}
+
+/// CM-распаковка целого кадра (обратная к cmz-frame) с контролем декодером.
+fn cmz_frame_decode_cmd(cmz_path: &str, output: &str) {
+    let data = fs::read(cmz_path).expect("чтение cmz-кадра");
+    let t0 = Instant::now();
+    let frame = lpaq_ctrl::cmz_decode_file(&data).expect("cmz-кадр декодирование");
+    let dt = t0.elapsed();
+    let text = codec::decode(&frame).expect("декодер восстановленного кадра");
+    fs::write(output, &text).expect("запись выхода");
+    println!(
+        "RESULT8\t{}\t{}\t{}\t{}",
+        cmz_path,
+        data.len(),
+        frame.len(),
+        dt.as_secs_f64()
+    );
+    eprintln!(
+        "cmz-frame-decode {cmz_path}: {} Б → {} Б кадра → {} Б текста ({:.1} c)",
+        data.len(),
+        frame.len(),
+        text.len(),
         dt.as_secs_f64()
     );
 }
