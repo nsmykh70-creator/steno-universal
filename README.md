@@ -26,12 +26,19 @@ STENO-UV — экспериментальный стенографический
 
 ```sh
 cargo build --release
-target/release/steno_file encode <вход> <каталог> [--cap N] [--min-count M] [--chars C] [--syll K]
+target/release/steno_file encode <вход> <каталог> [--cap N] [--min-count M] [--chars C] [--syll K] [--wclass W]
 target/release/steno_file decode <кадр> <выход>
 target/release/steno_file dumpstreams <кадр> <каталог>
 target/release/steno_file frec <ctrl> <каталог> [--order0]
 target/release/steno_file cmz <ctrl> <каталог>
 ```
+
+`--wclass W` (PS18) включает кодирование с предсказанием классов письма
+(концепция STENO-P7 Stage 14): Марковская модель порядка 2 над семью
+классами Unicode-письма обучается на жадном разборе входа словарём, её
+сюрпризал (в единицах 1/64 байта, множитель W) добавляется к стоимости
+рёбер DP-кодировщика. Модель не сериализуется — формат кадра и декодер
+не меняются; `W=0` эквивалентно PS17. Рядом пишется `<stem>.stuv_ctx`.
 
 Тесты: `cargo test --release`.
 
