@@ -1,0 +1,23 @@
+# PS24.3 — перенос приёмов LZ4: bulk-refill декодера, accel-пропуск (уровни 1-9),
+# фикс raw-escape перебега токенизатора (m10 «обрыв raw-чанка»).
+# Сравнение с ps24.2 (байт-точно): m10 L6 enc 11.1 -> 16.1 МиБ/с (+45%), L1 18.9 -> 36.2 (+91%);
+# L6 ratio fb2 -826 Б, m10 -442 Б; L1 m10 ratio +0.88 п.п. (цена accel=4), db L1 -0.05 п.п.
+dataset,codec,input_bytes,archive_bytes,ratio_percent,encode_mib_s,decode_mib_s,roundtrip
+677647.fb2,PS22-slz,47470221,14324224,30.175,14.105,164.828,true
+677647.fb2,PS22-slz-1,47470221,17263714,36.367,44.038,142.474,true
+677647.fb2,xz,47470221,7996760,16.846,1.816,178.359,true
+677647.fb2,gzip,47470221,12711022,26.777,11.822,148.146,true
+677647.fb2,lz4,47470221,22265478,46.904,202.200,1333.076,true
+677647.fb2,snappy,47470221,23137573,48.741,404.948,948.553,true
+mixed_10mb_compression_test.bin,PS22-slz,10485760,5562266,53.046,16.059,153.790,true
+mixed_10mb_compression_test.bin,PS22-slz-1,10485760,5772333,55.049,36.214,133.585,true
+mixed_10mb_compression_test.bin,xz,10485760,4629536,44.151,3.295,93.914,true
+mixed_10mb_compression_test.bin,gzip,10485760,5260600,50.169,23.332,161.125,true
+mixed_10mb_compression_test.bin,lz4,10485760,6920143,65.996,490.191,1786.931,true
+mixed_10mb_compression_test.bin,snappy,10485760,7035495,67.096,732.825,1480.646,true
+db_events.jsonl,PS22-slz,10486011,1242485,11.849,21.750,260.152,true
+db_events.jsonl,PS22-slz-1,10486011,1533998,14.629,63.780,248.090,true
+db_events.jsonl,xz,10486011,788364,7.518,3.987,232.690,true
+db_events.jsonl,gzip,10486011,1162573,11.087,63.375,247.882,true
+db_events.jsonl,lz4,10486011,1989875,18.976,574.696,2047.925,true
+db_events.jsonl,snappy,10486011,2271960,21.667,823.277,1221.539,true
