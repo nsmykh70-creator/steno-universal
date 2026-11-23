@@ -318,7 +318,19 @@ impl Tok {
                 break;
             }
             let maxlen = (input.len() - p).min(MAXMATCH);
+            // сравнение u64-словами: 8 байт за шаг, хвост — побайтово
             let mut l = 0usize;
+            while l + 8 <= maxlen {
+                let a = u64::from_le_bytes(input[c + l..c + l + 8].try_into().unwrap());
+                let b = u64::from_le_bytes(input[p + l..p + l + 8].try_into().unwrap());
+                let x = a ^ b;
+                if x == 0 {
+                    l += 8;
+                } else {
+                    l += (x.trailing_zeros() >> 3) as usize;
+                    break;
+                }
+            }
             while l < maxlen && input[c + l] == input[p + l] {
                 l += 1;
             }
