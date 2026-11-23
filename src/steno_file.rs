@@ -5,7 +5,12 @@
 //!   steno_file encode <вход> <каталог_вывода>  — кадры + восстановленные файлы
 //!   steno_file decode <кадр> <выход>           — кадр → исходные байты
 //!   steno_file cmz <поток> <каталог>           — CM-сжатие потока (файловый формат с длиной)
-//!   steno_file cmz-decode <файл.cmz> <выход>   — CM-распаковка потока
+//!   steno_file cmz-decode <файл.cmz> <выход>   — CM-распаковка потока (SU21 распознаётся)
+//!   steno_file cmz-frame <кадр> <каталог>      — CM-сжатие кадра целиком
+//!   steno_file cmz-frame-decode <файл> <выход> — CM-распаковка кадра (SU21 распознаётся)
+//!   steno_file s21-pack <исходник> <архив> <выход.s21>    — конверт SU21 (CRC-64)
+//!   steno_file s21-unpack <архив.s21> <выход> [--raw-frame] — проверка+распаковка
+//!   steno_file bench-s20 <файл> [--reps N]     — бенч по методологии Stage20 (CSV)
 //!   steno_file pack <hdr> <ctrl> <data> <кадр> — сборка кадра из частей архива
 //!   steno_file unpack <каталог> <stem> <выход> — полная распаковка архива пайплайна
 
@@ -30,8 +35,11 @@ fn main() {
         Some("cmz-frame-decode") if args.len() >= 4 => cmz_frame_decode_cmd(&args[2], &args[3]),
         Some("pack") if args.len() >= 6 => pack_cmd(&args[2], &args[3], &args[4], &args[5]),
         Some("unpack") if args.len() >= 5 => unpack_cmd(&args[2], &args[3], &args[4]),
+        Some("s21-pack") if args.len() >= 5 => s21_pack_cmd(&args[2], &args[3], &args[4]),
+        Some("s21-unpack") if args.len() >= 4 => s21_unpack_cmd(&args[2], &args[3], &args[4..]),
+        Some("bench-s20") if args.len() >= 3 => bench_s20_cmd(&args[2], &args[3..]),
         _ => {
-            eprintln!("использование: steno_file encode <вход> <каталог> [--cap N] [--min-count M] [--chars C] [--syll K] | decode <кадр> <выход> | dumpstreams <кадр> <каталог> | frec <ctrl> <каталог> [--order0] | cmz <поток> <каталог> | cmz-decode <файл.cmz> <выход> | cmz-frame <кадр> <каталог> | cmz-frame-decode <файл.frame.cmz> <выход> | pack <hdr> <ctrl> <data> <кадр> | unpack <каталог> <stem> <выход>");
+            eprintln!("использование: steno_file encode <вход> <каталог> | decode <кадр> <выход> | dumpstreams <кадр> <каталог> | frec <ctrl> <каталог> [--order0] | cmz <поток> <каталог> | cmz-decode <файл.cmz> <выход> | cmz-frame <кадр> <каталог> | cmz-frame-decode <файл> <выход> | s21-pack <исходник> <архив> <выход.s21> | s21-unpack <архив.s21> <выход> [--raw-frame] | bench-s20 <файл> [--reps N] | pack <hdr> <ctrl> <data> <кадр> | unpack <каталог> <stem> <выход>");
             std::process::exit(2);
         }
     }
@@ -307,10 +315,19 @@ fn cmz_cmd(ctrl_path: &str, outdir: &str) {
 }
 
 /// CM-распаковка файлового формата cmz (uvarint-длина + CM-поток).
+/// Если вход обёрнут в конверт SU21 (PS21) — конверт снимается, а после
+/// декодирования проверяются длина и CRC-64 до выдачи результата.
 fn cmz_decode_cmd(cmz_path: &str, output: &str) {
     let data = fs::read(cmz_path).expect("чтение cmz");
     let t0 = Instant::now();
-    let out = lpaq_ctrl::cmz_decode_file(&data).expect("cmz декодирование");
+    let (payload, wrapped) = match steno_uv::integrity::try_unwrap(&data) {
+        Some(inner) => (inner, true),
+        None => (&data[..], false),
+    };
+    let out = lpaq_ctrl::cmz_decode_file(payload).expect("cmz декодирование");
+    if wrapped {
+        steno_uv::integrity::verify(&data, &out).expect("конверт SU21: проверка целостности");
+    }
     let dt = t0.elapsed();
     fs::write(output, &out).expect("запись распакованного потока");
     println!(
@@ -362,12 +379,22 @@ fn cmz_frame_cmd(frame_path: &str, outdir: &str) {
 }
 
 /// CM-распаковка целого кадра (обратная к cmz-frame) с контролем декодером.
+/// Конверт SU21 (PS21) распознаётся автоматически: конверт снимается, кадр
+/// декодируется, после чего проверяются заявленная длина и CRC-64 исходных
+/// байтов до записи результата.
 fn cmz_frame_decode_cmd(cmz_path: &str, output: &str) {
     let data = fs::read(cmz_path).expect("чтение cmz-кадра");
     let t0 = Instant::now();
-    let frame = lpaq_ctrl::cmz_decode_file(&data).expect("cmz-кадр декодирование");
-    let dt = t0.elapsed();
+    let (payload, wrapped) = match steno_uv::integrity::try_unwrap(&data) {
+        Some(inner) => (inner, true),
+        None => (&data[..], false),
+    };
+    let frame = lpaq_ctrl::cmz_decode_file(payload).expect("cmz-кадр декодирование");
     let text = codec::decode(&frame).expect("декодер восстановленного кадра");
+    if wrapped {
+        steno_uv::integrity::verify(&data, &text).expect("конверт SU21: проверка целостности");
+    }
+    let dt = t0.elapsed();
     fs::write(output, &text).expect("запись выхода");
     println!(
         "RESULT8\t{}\t{}\t{}\t{}",
@@ -436,4 +463,228 @@ fn unpack_cmd(dir: &str, stem: &str, output: &str) {
         hdr.len() + ctrl_c.len() + data_c.len(),
         t_all.elapsed().as_secs_f64()
     );
+}
+
+/// PS21: обёртка готового архива в конверт SU21 (методика Stage20):
+/// магия + версия + исходная длина + CRC-64 исходных байтов + архив.
+fn s21_pack_cmd(orig_path: &str, archive_path: &str, output: &str) {
+    let orig = fs::read(orig_path).expect("чтение исходного файла");
+    let archive = fs::read(archive_path).expect("чтение архива");
+    let t0 = Instant::now();
+    let wrapped = steno_uv::integrity::wrap(&archive, &orig);
+    let dt = t0.elapsed();
+    fs::write(output, &wrapped).expect("запись конверта SU21");
+    println!(
+        "RESULT21\t{}\t{}\t{}\t{}\t{}",
+        output,
+        orig.len(),
+        archive.len(),
+        wrapped.len(),
+        dt.as_secs_f64()
+    );
+    eprintln!(
+        "s21-pack {output}: архив {} Б + конверт {} Б = {} Б ({:.3} c)",
+        archive.len(),
+        steno_uv::integrity::HEADER_LEN,
+        wrapped.len(),
+        dt.as_secs_f64()
+    );
+}
+
+/// PS21: проверка конверта SU21 и распаковка в исходные байты. Длина и
+/// CRC-64 сверяются с декодированными байтами ДО записи выхода.
+/// По умолчанию вложенный архив — cmz-кадр (cmz_decode_file → codec::decode);
+/// флаг --raw-frame — вложен stuv-кадр напрямую (только codec::decode).
+fn s21_unpack_cmd(archive_path: &str, output: &str, flags: &[String]) {
+    let raw_frame = flags.iter().any(|f| f == "--raw-frame");
+    let data = fs::read(archive_path).expect("чтение конверта SU21");
+    let t0 = Instant::now();
+    let inner = steno_uv::integrity::try_unwrap(&data)
+        .expect("вход не является конвертом SU21");
+    let raw = if raw_frame {
+        codec::decode(inner).expect("декодер вложенного кадра")
+    } else {
+        let frame = lpaq_ctrl::cmz_decode_file(inner).expect("CM-декодирование вложенного кадра");
+        codec::decode(&frame).expect("декодер восстановленного кадра")
+    };
+    steno_uv::integrity::verify(&data, &raw).expect("конверт SU21: проверка целостности");
+    let dt = t0.elapsed();
+    fs::write(output, &raw).expect("запись исходного файла");
+    println!(
+        "RESULT22\t{}\t{}\t{}\t{}",
+        output,
+        raw.len(),
+        data.len(),
+        dt.as_secs_f64()
+    );
+    eprintln!(
+        "s21-unpack {output}: {} Б исходника из {} Б конверта, CRC-64 OK ({:.1} c)",
+        raw.len(),
+        data.len(),
+        dt.as_secs_f64()
+    );
+}
+
+/// PS21: бенч реального файла по методологии Stage20 — полный размер
+/// контейнера, раздельные тайминги encode/decode, обязательная побайтовая
+/// верификация, конкуренты (xz/gzip/zstd) на тех же байтах. Строки CSV:
+/// dataset,codec,input_bytes,archive_bytes,ratio_percent,encode_mib_s,decode_mib_s,roundtrip.
+/// Наш пайплайн: train + stuv-кадр → cmz-кадр → конверт SU21.
+fn bench_s20_cmd(input: &str, flags: &[String]) {
+    let reps = flags
+        .iter()
+        .position(|f| f == "--reps")
+        .and_then(|i| flags.get(i + 1))
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let raw = fs::read(input).expect("чтение входного файла");
+    let name = std::path::Path::new(input)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(input)
+        .to_string();
+
+    // --- наш пайплайн: train + stuv-кадр ---
+    let t_train = Instant::now();
+    let trained =
+        train::train(&raw, &Dictionary::static_only(), &TrainConfig::default()).expect("обучение");
+    let train_d = t_train.elapsed();
+    let t_enc = Instant::now();
+    let (frame, _) = codec::encode(&raw, &trained).expect("кодирование кадра");
+    let enc_d = t_enc.elapsed();
+    let t_dec = Instant::now();
+    let restored = codec::decode(&frame).expect("декодер кадра");
+    let frame_dec_d = t_dec.elapsed();
+    let frame_ok = restored == raw;
+
+    // --- CM-сжатие кадра целиком (PS19) ---
+    let t_cmz = Instant::now();
+    let cmz = lpaq_ctrl::cmz_encode_file(&frame).expect("cmz-кадр кодирование");
+    let cmz_enc_d = t_cmz.elapsed();
+    let t_cmzd = Instant::now();
+    let frame_back = lpaq_ctrl::cmz_decode_file(&cmz).expect("cmz-кадр декодирование");
+    let cmz_dec_d = t_cmzd.elapsed();
+    let cmz_ok = frame_back == frame;
+
+    // --- конверт SU21 (PS21) ---
+    let t_wrap = Instant::now();
+    let container = steno_uv::integrity::wrap(&cmz, &raw);
+    let wrap_d = t_wrap.elapsed();
+    let t_unwrap = Instant::now();
+    let inner = steno_uv::integrity::try_unwrap(&container).expect("конверт распознаётся");
+    let frame_back2 = lpaq_ctrl::cmz_decode_file(inner).expect("cmz декодирование конверта");
+    let raw_back = codec::decode(&frame_back2).expect("декодер кадра из конверта");
+    steno_uv::integrity::verify(&container, &raw_back).expect("проверка SU21");
+    let unwrap_d = t_unwrap.elapsed();
+    let s21_ok = raw_back == raw;
+
+    let pipeline_enc = train_d + enc_d + cmz_enc_d + wrap_d;
+    let pipeline_dec = unwrap_d;
+    let mib = raw.len() as f64 / 1_048_576.0;
+    let speed = |d: std::time::Duration| {
+        if d.is_zero() {
+            0.0
+        } else {
+            mib / d.as_secs_f64()
+        }
+    };
+    println!("dataset,codec,input_bytes,archive_bytes,ratio_percent,encode_mib_s,decode_mib_s,roundtrip");
+    let row = |codec: &str, bytes: usize, enc: f64, dec: f64, ok: bool| {
+        println!(
+            "{},{},{},{},{:.3},{:.3},{:.3},{}",
+            name,
+            codec,
+            raw.len(),
+            bytes,
+            bytes as f64 * 100.0 / raw.len().max(1) as f64,
+            enc,
+            dec,
+            ok
+        );
+    };
+    row("stuv-кадр", frame.len(), speed(enc_d), speed(frame_dec_d), frame_ok);
+    row(
+        "PS19-cmz-кадр",
+        cmz.len(),
+        speed(enc_d + cmz_enc_d),
+        speed(cmz_dec_d + frame_dec_d),
+        cmz_ok,
+    );
+    row(
+        "PS21-s21",
+        container.len(),
+        speed(pipeline_enc),
+        speed(pipeline_dec),
+        s21_ok,
+    );
+    eprintln!(
+        "стадии: train {:.1} c | stuv enc {:.1} c dec {:.1} c | cmz enc {:.1} c dec {:.1} c | wrap {:.3} c unwrap {:.1} c",
+        train_d.as_secs_f64(),
+        enc_d.as_secs_f64(),
+        frame_dec_d.as_secs_f64(),
+        cmz_enc_d.as_secs_f64(),
+        cmz_dec_d.as_secs_f64(),
+        wrap_d.as_secs_f64(),
+        unwrap_d.as_secs_f64()
+    );
+
+    // --- конкуренты на тех же байтах (методика Stage20) ---
+    for _ in 0..reps.saturating_sub(1) {
+        // повторы таймингов: прогон конкурентами для усреднения
+        let _ = run_filter("xz", &["-c"], &raw);
+        let _ = run_filter("gzip", &["-c"], &raw);
+    }
+    for (codec_name, enc_args, dec_args) in [
+        ("xz", &["-c"][..], &["-d", "-c"][..]),
+        ("gzip", &["-c"][..], &["-d", "-c"][..]),
+        ("zstd", &["-q", "-c"][..], &["-q", "-d", "-c"][..]),
+    ] {
+        let t0 = Instant::now();
+        let compressed = match run_filter(codec_name, &enc_args, &raw) {
+            Some(c) => c,
+            None => {
+                eprintln!("SKIP: {codec_name} недоступен или не сжал {name}");
+                continue;
+            }
+        };
+        let enc = t0.elapsed();
+        let t0 = Instant::now();
+        let verified = match run_filter(codec_name, &dec_args, &compressed) {
+            Some(d) => d == raw,
+            None => false,
+        };
+        let dec = t0.elapsed();
+        row(codec_name, compressed.len(), speed(enc), speed(dec), verified);
+    }
+}
+
+/// Запуск внешнего кодека через пайпы без дедлоков: stdout вычитывается
+/// параллельным потоком (методика Stage20), затем stdin закрывается.
+fn run_filter(program: &str, args: &[&str], input: &[u8]) -> Option<Vec<u8>> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        stdout.read_to_end(&mut out).map(|_| out)
+    });
+    {
+        let mut stdin = child.stdin.take()?;
+        stdin.write_all(input).ok()?;
+    }
+    let status = child.wait().ok()?;
+    let out = reader.join().ok()?.ok()?;
+    if status.success() {
+        Some(out)
+    } else {
+        None
+    }
 }

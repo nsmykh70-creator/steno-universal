@@ -38,6 +38,7 @@ pub mod codec;
 pub mod corpus;
 pub mod dict;
 pub mod frec;
+pub mod integrity;
 pub mod lpaq_ctrl;
 pub mod regular;
 pub mod sym_short;
