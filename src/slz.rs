@@ -18,16 +18,29 @@ const MAXMATCH: usize = 1 << 20;
 const WINDOW: usize = 1 << 24;
 const BLOCK: usize = 1 << 20;
 const HASH_BITS: u32 = 22;
-const DEPTH: usize = 32;
-const LAZY_DEPTH: usize = 16;
-const GOOD_LEN: usize = 48;
 const MAX_CODE_LEN: u32 = 15;
 const MTF_SLOTS: usize = 4;
 const NOPOS: u32 = u32::MAX;
 /// символы 0..15 — точные значения, 16+log2 — бакет с экстра-битами
 const EXACT: u32 = 16;
+/// селектор rep0: совпадение по «последнему офсету» mtf[0] — офсет не
+/// передаётся и MTF не сдвигается. 0..3 — слоты MTF, 4+log — новый офсет
+/// (log ≤ 24 → sel ≤ 28), 29 остаётся свободным
+const REP_SEL: u32 = 29;
 
-pub const MAGIC: &[u8; 4] = b"SLZ1";
+pub const MAGIC: &[u8; 4] = b"SLZ2";
+
+/// пресеты уровней скорости: (глубина цепочки, lazy-глубина, GOOD_LEN).
+/// Уровень 1 — greedy без lazy (прямой конкурент lz4), 6 — дефолт PS23.2.
+fn level_params(level: usize) -> (usize, usize, usize) {
+    match level {
+        0 | 1 => (8, 0, 16),
+        2 | 3 => (16, 8, 24),
+        4..=9 => (32, 16, 48),
+        10..=14 => (64, 24, 96),
+        _ => (128, 32, 256),
+    }
+}
 
 #[inline]
 fn put_uvarint(mut v: u64, out: &mut Vec<u8>) {
@@ -303,7 +316,7 @@ fn hash4(data: &[u8], i: usize) -> usize {
 struct Seq {
     /// литеральный ран перед этим совпадением
     run: u32,
-    /// 0..3 — слот MTF; 4+log — новый офсет с остатком в `extra_off`
+    /// REP_SEL — rep0; 0..3 — слот MTF; 4+log — новый офсет с остатком
     sel: u32,
     extra_off: u32,
     len_m: u32, // len - MINMATCH
@@ -317,16 +330,23 @@ struct Tok {
     mtf: [u32; MTF_SLOTS],
     i: usize,
     lit_run: u32,
+    /// параметры уровня скорости (см. level_params)
+    depth: usize,
+    lazy_depth: usize,
+    good_len: usize,
 }
 
 impl Tok {
-    fn new() -> Self {
+    fn with_params(depth: usize, lazy_depth: usize, good_len: usize) -> Self {
         Tok {
             head: vec![NOPOS; 1usize << HASH_BITS],
             prev: vec![NOPOS; WINDOW],
             mtf: [1, 2, 3, 4],
             i: 0,
             lit_run: 0,
+            depth,
+            lazy_depth,
+            good_len,
         }
     }
 
@@ -359,6 +379,44 @@ impl Tok {
         }
     }
 
+    /// длина совпадения входа с позиции p с кандидатом c (u64-словами:
+    /// 8 байт за шаг, хвост — побайтово; границы доказаны: p+maxlen <= n,
+    /// c < p => c+maxlen < n)
+    fn extend_len(&self, input: &[u8], c: usize, p: usize) -> usize {
+        let maxlen = (input.len() - p).min(MAXMATCH);
+        debug_assert!(c < p && p + maxlen <= input.len());
+        let mut l = 0usize;
+        while l + 8 <= maxlen {
+            let a = u64::from_le_bytes(unsafe {
+                (input.as_ptr().add(c + l) as *const [u8; 8]).read_unaligned()
+            });
+            let b = u64::from_le_bytes(unsafe {
+                (input.as_ptr().add(p + l) as *const [u8; 8]).read_unaligned()
+            });
+            let x = a ^ b;
+            if x == 0 {
+                l += 8;
+            } else {
+                l += (x.trailing_zeros() >> 3) as usize;
+                break;
+            }
+        }
+        while l < maxlen && input[c + l] == input[p + l] {
+            l += 1;
+        }
+        l
+    }
+
+    /// длина совпадения по «последнему офсету» (rep0): офсет mtf[0],
+    /// при кодировании он бесплатен — селектор один вместо слота+длины
+    fn rep_len(&self, input: &[u8], p: usize) -> usize {
+        let off = self.mtf[0] as usize;
+        if off == 0 || p < off || p + MINMATCH > input.len() {
+            return 0;
+        }
+        self.extend_len(input, p - off, p)
+    }
+
     /// лучший кандидат с позиции p: (len, off)
     fn best_at(&self, input: &[u8], p: usize, depth: usize) -> (usize, usize) {
         if p + MINMATCH > input.len() {
@@ -372,33 +430,11 @@ impl Tok {
             if p - c > WINDOW {
                 break;
             }
-            let maxlen = (input.len() - p).min(MAXMATCH);
-            // сравнение u64-словами: 8 байт за шаг, хвост — побайтово;
-            // границы доказаны: p+maxlen <= n, c < p => c+maxlen < n
-            debug_assert!(c < p && p + maxlen <= input.len());
-            let mut l = 0usize;
-            while l + 8 <= maxlen {
-                let a = u64::from_le_bytes(unsafe {
-                    (input.as_ptr().add(c + l) as *const [u8; 8]).read_unaligned()
-                });
-                let b = u64::from_le_bytes(unsafe {
-                    (input.as_ptr().add(p + l) as *const [u8; 8]).read_unaligned()
-                });
-                let x = a ^ b;
-                if x == 0 {
-                    l += 8;
-                } else {
-                    l += (x.trailing_zeros() >> 3) as usize;
-                    break;
-                }
-            }
-            while l < maxlen && input[c + l] == input[p + l] {
-                l += 1;
-            }
+            let l = self.extend_len(input, c, p);
             if l > bl {
                 bl = l;
                 bo = p - c;
-                if bl >= GOOD_LEN {
+                if bl >= self.good_len {
                     break;
                 }
             }
@@ -427,6 +463,19 @@ impl Tok {
         self.lit_run = 0;
     }
 
+    /// rep0-совпадение: селектор REP_SEL, офсет mtf[0] не передаётся и
+    /// MTF не сдвигается (офсет остаётся «последним» для следующих rep0)
+    fn emit_rep(&mut self, seqs: &mut Vec<Seq>, len: usize) {
+        let len_m = (len - MINMATCH) as u32;
+        seqs.push(Seq {
+            run: self.lit_run,
+            sel: REP_SEL,
+            extra_off: 0,
+            len_m,
+        });
+        self.lit_run = 0;
+    }
+
     /// Токенизация до target_end (совпадения могут пересекать границу чанка).
     fn run_chunk(&mut self, input: &[u8], target_end: usize) -> (Vec<u8>, Vec<Seq>) {
         let n = input.len();
@@ -440,10 +489,26 @@ impl Tok {
                 self.i += 1;
                 continue;
             }
-            let (bl, bo) = self.best_at(input, i, DEPTH);
+            // rep0: сильное совпадение по последнему офсету (≥8) принимаем
+            // сразу — обход цепочек кандидатов не нужен
+            let rl = self.rep_len(input, i);
+            if rl >= 8 {
+                self.emit_rep(&mut seqs, rl);
+                self.insert_match(input, i, rl);
+                self.i += rl;
+                continue;
+            }
+            let (bl, bo) = self.best_at(input, i, self.depth);
+            if rl >= MINMATCH && rl > bl {
+                // слабый rep0 — берём, только если он длиннее кандидата
+                self.emit_rep(&mut seqs, rl);
+                self.insert_match(input, i, rl);
+                self.i += rl;
+                continue;
+            }
             // lazy-1: короткое совпадение — проверяем позицию i+1
-            if bl < GOOD_LEN && i + 1 + MINMATCH <= n {
-                let (l2, o2) = self.best_at(input, i + 1, LAZY_DEPTH);
+            if self.lazy_depth > 0 && bl < self.good_len && i + 1 + MINMATCH <= n {
+                let (l2, o2) = self.best_at(input, i + 1, self.lazy_depth);
                 if l2 >= MINMATCH && l2 > bl {
                     lits.push(input[i]);
                     self.lit_run += 1;
@@ -473,27 +538,54 @@ impl Tok {
     }
 }
 
-/// Кодирование полного SLZ-потока (без конверта SU21).
+/// Кодирование полного SLZ-потока уровнем по умолчанию (без конверта SU21).
 pub fn encode(input: &[u8]) -> Vec<u8> {
+    encode_level(input, 6)
+}
+
+/// Кодирование с уровнем скорости 1 (fast, конкурент lz4) … 19 (глубокие
+/// цепочки + lazy). Формат потока от уровня не зависит.
+pub fn encode_level(input: &[u8], level: usize) -> Vec<u8> {
     let n = input.len();
     let mut out = Vec::with_capacity(n / 2 + 64);
     out.extend_from_slice(MAGIC);
     put_uvarint(n as u64, &mut out);
     let nchunks = n.div_ceil(BLOCK).max(1);
     put_uvarint(nchunks as u64, &mut out);
-    let mut tok = Tok::new();
+    let (depth, lazy_depth, good_len) = level_params(level);
+    let mut tok = Tok::with_params(depth, lazy_depth, good_len);
     for _ in 0..nchunks {
+        let chunk_start = tok.i;
         let target_end = (tok.i + BLOCK).min(n);
+        let chunk_len = target_end - chunk_start;
         let (lits, seqs) = tok.run_chunk(input, target_end);
-        encode_chunk(&mut out, &lits, &seqs);
+        // raw-escape: если чанк не сжался, пишем его как есть (флаг 1) —
+        // декодер копирует chunk_len байт; гарантирует «не хуже хранения»
+        let mut enc = Vec::with_capacity(chunk_len / 2 + 512);
+        encode_chunk(&mut enc, &lits, &seqs);
+        if enc.len() < chunk_len {
+            out.push(0);
+            out.extend_from_slice(&enc);
+        } else {
+            out.push(1);
+            out.extend_from_slice(&input[chunk_start..target_end]);
+            // токены этого чанка выброшены — ресет MTF синхронен декодеру
+            tok.mtf = [1, 2, 3, 4];
+        }
     }
     out
 }
 
-/// Частоты бакетов: раны литералов, селекторы, длины.
-fn seq_freqs(seqs: &[Seq]) -> ([u32; EXACT as usize + 25], [u32; 29], [u32; EXACT as usize + 22]) {
+/// Частоты бакетов: раны литералов, селекторы (включая rep0=29), длины.
+fn seq_freqs(
+    seqs: &[Seq],
+) -> (
+    [u32; EXACT as usize + 25],
+    [u32; EXACT as usize + 14], // 30: слоты MTF + 4+log + rep0
+    [u32; EXACT as usize + 22],
+) {
     let mut fr = [0u32; EXACT as usize + 25];
-    let mut fs = [0u32; 29];
+    let mut fs = [0u32; EXACT as usize + 14];
     // len_m до MAXMATCH-4 → log до 20 → символ EXACT+20=36; запас до 21
     let mut fl = [0u32; EXACT as usize + 22];
     for s in seqs {
@@ -550,7 +642,8 @@ fn encode_chunk(out: &mut Vec<u8>, lits: &[u8], seqs: &[Seq]) {
         rbw.write(cr[sym as usize], lr[sym as usize] as u32);
         put_extra(&mut extra, bits, val);
         sbw.write(cs[s.sel as usize], ls[s.sel as usize] as u32);
-        if s.sel >= 4 {
+        // rep0 (REP_SEL) не имеет экстра-бит: офсет не передаётся вообще
+        if s.sel >= 4 && s.sel != REP_SEL {
             let log = s.sel - 4;
             put_extra(&mut extra, log, s.extra_off);
         }
@@ -576,7 +669,7 @@ fn encode_chunk(out: &mut Vec<u8>, lits: &[u8], seqs: &[Seq]) {
 /// возвращает исходные байты.
 pub fn decode(data: &[u8], max_output: usize) -> Result<Vec<u8>, &'static str> {
     if data.len() < 7 || &data[..4] != MAGIC {
-        return Err("slz: магия не SLZ1");
+        return Err("slz: магия не SLZ2");
     }
     let mut pos = 4usize;
     let orig_len = get_uvarint(data, &mut pos)? as usize;
@@ -587,6 +680,21 @@ pub fn decode(data: &[u8], max_output: usize) -> Result<Vec<u8>, &'static str> {
     let mut out: Vec<u8> = Vec::with_capacity(orig_len);
     let mut mtf: [u32; MTF_SLOTS] = [1, 2, 3, 4];
     for _ in 0..nchunks {
+        // флаг чанка: 0 — обычный (Хаффман), 1 — raw-escape (копия как есть)
+        if *data.get(pos).ok_or("slz: обрыв флага чанка")? != 0 {
+            pos += 1;
+            let raw_len = BLOCK.min(orig_len.checked_sub(out.len()).ok_or("slz: выход превысил заявленную длину")?);
+            if pos + raw_len > data.len() {
+                return Err("slz: обрыв raw-чанка");
+            }
+            out.extend_from_slice(&data[pos..pos + raw_len]);
+            pos += raw_len;
+            // токены raw-чанка декодер не видит — MTF синхронно ресетится
+            // на обеих сторонах (энкодер делает то же при escape)
+            mtf = [1, 2, 3, 4];
+            continue;
+        }
+        pos += 1;
         let lit_count = get_uvarint(data, &mut pos)? as usize;
         let seq_count = get_uvarint(data, &mut pos)? as usize;
         // литералы чанка — отдельный буфер с перемежением ранами
@@ -661,7 +769,11 @@ pub fn decode(data: &[u8], max_output: usize) -> Result<Vec<u8>, &'static str> {
                 lit_pos += run;
                 // офсет
                 let sel = sb.decode_sym(&tables[1])? as u32;
-                let off: usize = if (sel as usize) < MTF_SLOTS {
+                let off: usize = if sel == REP_SEL {
+                    // rep0: офсет — mtf[0], сам офсет не передаётся,
+                    // MTF не сдвигается
+                    mtf[0] as usize
+                } else if (sel as usize) < MTF_SLOTS {
                     let s = sel as usize;
                     let v = mtf[s];
                     mtf.copy_within(0..s, 1);
@@ -878,5 +990,61 @@ mod tests {
             slz.len(),
             worst
         );
+    }
+
+    /// Raw-escape: на псевдослучайных данных (3 чанка) контейнер не
+    /// распухает — каждый несжимаемый чанк пишется как есть.
+    #[test]
+    fn raw_escape_on_incompressible() {
+        let n = (BLOCK * 5 / 2 / 4) * 4;
+        let v: Vec<u8> = (0..n)
+            .map(|i| (i as u64 * 6364136223846793005 >> 33) as u8)
+            .collect();
+        let enc = encode(&v);
+        println!(
+            "raw_escape: вход {} Б → {} Б (перерасход {} Б)",
+            v.len(),
+            enc.len(),
+            enc.len() - v.len()
+        );
+        assert_eq!(decode(&enc, v.len()).unwrap(), v);
+        assert!(
+            enc.len() <= v.len() + 64,
+            "raw-escape: перерасход {} Б недопустим",
+            enc.len() - v.len()
+        );
+    }
+
+    /// Все уровни скорости корректно кодируют и декодируют; формат общий.
+    #[test]
+    fn levels_roundtrip() {
+        let mut v = Vec::new();
+        v.extend(
+            b"the quick brown fox jumps over the lazy dog. "
+                .iter()
+                .cycle()
+                .take(50_000),
+        );
+        v.extend((0..20_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8));
+        for level in [1usize, 3, 6, 12, 19] {
+            let enc = encode_level(&v, level);
+            assert_eq!(decode(&enc, v.len()).unwrap(), v, "уровень {level}");
+            println!("уровень {level}: {} Б", enc.len());
+        }
+    }
+
+    /// rep0: одинаковые интервалы между копиями блока — повторные копии
+    /// берутся по «последнему офсету» без передачи самого офсета.
+    #[test]
+    fn rep0_offsets_reconstruct() {
+        let mut v = Vec::new();
+        let block: Vec<u8> = (0..64u32).map(|i| b'A' + (i * 7 % 26) as u8).collect();
+        v.push(b'X');
+        v.extend_from_slice(&block);
+        for _ in 0..10 {
+            v.push(b'Y');
+            v.extend_from_slice(&block);
+        }
+        rt(&v);
     }
 }
