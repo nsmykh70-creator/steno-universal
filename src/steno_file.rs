@@ -57,6 +57,64 @@ fn main() {
                 .and_then(|k| args[4..].get(k + 1));
             slz_decode_cmd(&args[2], &args[3], dict)
         }
+        // PS25: конверт псевдо-избыточности (обратимый трансформ + SLZ)
+        Some("su25-pack") if args.len() >= 4 => {
+            let input = fs::read(&args[2]).expect("чтение входа su25-pack");
+            let level = args[4..]
+                .iter()
+                .position(|f| f == "--level")
+                .and_then(|k| args[4..].get(k + 1))
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(6);
+            let t = Instant::now();
+            let (variant, packed) = steno_uv::pseudox::su25_pack(&input, level);
+            fs::write(&args[3], &packed).expect("запись su25");
+            eprintln!(
+                "su25: вариант {:?}, enc {:.2} с, {} -> {} байт ({:.2}%)",
+                variant,
+                t.elapsed().as_secs_f64(),
+                input.len(),
+                packed.len(),
+                packed.len() as f64 * 100.0 / input.len() as f64
+            );
+        }
+        Some("su25-unpack") if args.len() >= 4 => {
+            let data = fs::read(&args[2]).expect("чтение su25");
+            let out = steno_uv::pseudox::su25_unpack(&data).expect("su25 распаковка");
+            fs::write(&args[3], &out).expect("запись выхода su25-unpack");
+        }
+        // PS26: конверт сегрегации (блоки A/B, трансформы на B)
+        Some("su26-pack") if args.len() >= 4 => {
+            let input = fs::read(&args[2]).expect("чтение входа su26-pack");
+            let level = args[4..]
+                .iter()
+                .position(|f| f == "--level")
+                .and_then(|k| args[4..].get(k + 1))
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(6);
+            let block = args[4..]
+                .iter()
+                .position(|f| f == "--block")
+                .and_then(|k| args[4..].get(k + 1))
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(steno_uv::pseudox::SU26_BLOCK);
+            let t = Instant::now();
+            let packed = steno_uv::pseudox::su26_pack(&input, level, block);
+            fs::write(&args[3], &packed).expect("запись su26");
+            eprintln!(
+                "su26: блок {}, enc {:.2} с, {} -> {} байт ({:.2}%)",
+                block,
+                t.elapsed().as_secs_f64(),
+                input.len(),
+                packed.len(),
+                packed.len() as f64 * 100.0 / input.len() as f64
+            );
+        }
+        Some("su26-unpack") if args.len() >= 4 => {
+            let data = fs::read(&args[2]).expect("чтение su26");
+            let out = steno_uv::pseudox::su26_unpack(&data).expect("su26 распаковка");
+            fs::write(&args[3], &out).expect("запись выхода su26-unpack");
+        }
         Some("bench-s20") if args.len() >= 3 => bench_s20_cmd(&args[2], &args[3..]),
         _ => {
             eprintln!("использование: steno_file encode <вход> <каталог> | decode <кадр> <выход> | dumpstreams <кадр> <каталог> | frec <ctrl> <каталог> [--order0] | cmz <поток> <каталог> | cmz-decode <файл.cmz> <выход> | cmz-frame <кадр> <каталог> | cmz-frame-decode <файл> <выход> | s21-pack <исходник> <архив> <выход.s21> | s21-unpack <архив.s21> <выход> [--raw-frame] | slz <вход> <выход.s21> [--level 1|3|6|12|19] [--dict файл] | slz-decode <архив.s21> <выход> [--dict файл] | bench-s20 <файл> [--reps N] | pack <hdr> <ctrl> <data> <кадр> | unpack <каталог> <stem> <выход>");
@@ -649,6 +707,41 @@ fn bench_s20_cmd(input: &str, flags: &[String]) {
     let slz_back = steno_uv::slz::decode(slz_inner, raw.len()).expect("slz декодирование");
     steno_uv::integrity::verify(&slz_container, &slz_back).expect("проверка SU21 у slz");
     let slz_dec_d = t_slzd.elapsed();
+    // --- PS25-su25: обратимый трансформ «псевдо-избыточности» + SLZ ---
+    let t25 = Instant::now();
+    let (variant25, su25_stream) = steno_uv::pseudox::su25_pack(&raw, 6);
+    let su25_container = steno_uv::integrity::wrap(&su25_stream, &raw);
+    let su25_enc_d = t25.elapsed();
+    let t25d = Instant::now();
+    let su25_inner = steno_uv::integrity::try_unwrap(&su25_container).expect("SU21 у su25");
+    let su25_back = steno_uv::pseudox::su25_unpack(su25_inner).expect("su25 декодирование");
+    steno_uv::integrity::verify(&su25_container, &su25_back).expect("проверка SU21 у su25");
+    let su25_dec_d = t25d.elapsed();
+    eprintln!("PS25: выбран трансформ {variant25:?}");
+    row(
+        "PS25-su25",
+        su25_container.len(),
+        speed(su25_enc_d),
+        speed(su25_dec_d),
+        su25_back == raw,
+    );
+    // --- PS26-su26: сегрегация блоков (A: сжимаемые, B: шум+трансформ) ---
+    let t26 = Instant::now();
+    let su26_stream = steno_uv::pseudox::su26_pack(&raw, 6, steno_uv::pseudox::SU26_BLOCK);
+    let su26_container = steno_uv::integrity::wrap(&su26_stream, &raw);
+    let su26_enc_d = t26.elapsed();
+    let t26d = Instant::now();
+    let su26_inner = steno_uv::integrity::try_unwrap(&su26_container).expect("SU21 у su26");
+    let su26_back = steno_uv::pseudox::su26_unpack(su26_inner).expect("su26 декодирование");
+    steno_uv::integrity::verify(&su26_container, &su26_back).expect("проверка SU21 у su26");
+    let su26_dec_d = t26d.elapsed();
+    row(
+        "PS26-su26",
+        su26_container.len(),
+        speed(su26_enc_d),
+        speed(su26_dec_d),
+        su26_back == raw,
+    );
     row(
         "PS22-slz",
         slz_container.len(),
