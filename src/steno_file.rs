@@ -44,12 +44,22 @@ fn main() {
                 .and_then(|k| args[4..].get(k + 1))
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(6);
-            slz_cmd(&args[2], &args[3], level)
+            let dict = args[4..]
+                .iter()
+                .position(|f| f == "--dict")
+                .and_then(|k| args[4..].get(k + 1));
+            slz_cmd(&args[2], &args[3], level, dict)
         }
-        Some("slz-decode") if args.len() >= 4 => slz_decode_cmd(&args[2], &args[3]),
+        Some("slz-decode") if args.len() >= 4 => {
+            let dict = args[4..]
+                .iter()
+                .position(|f| f == "--dict")
+                .and_then(|k| args[4..].get(k + 1));
+            slz_decode_cmd(&args[2], &args[3], dict)
+        }
         Some("bench-s20") if args.len() >= 3 => bench_s20_cmd(&args[2], &args[3..]),
         _ => {
-            eprintln!("использование: steno_file encode <вход> <каталог> | decode <кадр> <выход> | dumpstreams <кадр> <каталог> | frec <ctrl> <каталог> [--order0] | cmz <поток> <каталог> | cmz-decode <файл.cmz> <выход> | cmz-frame <кадр> <каталог> | cmz-frame-decode <файл> <выход> | s21-pack <исходник> <архив> <выход.s21> | s21-unpack <архив.s21> <выход> [--raw-frame] | slz <вход> <выход.s21> [--level 1|3|6|12|19] | slz-decode <архив.s21> <выход> | bench-s20 <файл> [--reps N] | pack <hdr> <ctrl> <data> <кадр> | unpack <каталог> <stem> <выход>");
+            eprintln!("использование: steno_file encode <вход> <каталог> | decode <кадр> <выход> | dumpstreams <кадр> <каталог> | frec <ctrl> <каталог> [--order0] | cmz <поток> <каталог> | cmz-decode <файл.cmz> <выход> | cmz-frame <кадр> <каталог> | cmz-frame-decode <файл> <выход> | s21-pack <исходник> <архив> <выход.s21> | s21-unpack <архив.s21> <выход> [--raw-frame] | slz <вход> <выход.s21> [--level 1|3|6|12|19] [--dict файл] | slz-decode <архив.s21> <выход> [--dict файл] | bench-s20 <файл> [--reps N] | pack <hdr> <ctrl> <data> <кадр> | unpack <каталог> <stem> <выход>");
             std::process::exit(2);
         }
     }
@@ -773,10 +783,14 @@ fn run_filter(program: &str, args: &[&str], input: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// PS22: быстрое сжатие SLZ (LZ77+Huffman) с конвертом SU21.
-fn slz_cmd(input: &str, output: &str, level: usize) {
+fn slz_cmd(input: &str, output: &str, level: usize, dict_path: Option<&String>) {
     let raw = fs::read(input).expect("чтение входного файла");
+    let dict: Option<Vec<u8>> = dict_path.map(|p| fs::read(p).expect("чтение словаря"));
     let t0 = Instant::now();
-    let stream = steno_uv::slz::encode_level(&raw, level);
+    let stream = match &dict {
+        Some(d) => steno_uv::slz::encode_dict(&raw, d, level),
+        None => steno_uv::slz::encode_level(&raw, level),
+    };
     let container = steno_uv::integrity::wrap(&stream, &raw);
     let dt = t0.elapsed();
     fs::write(output, &container).expect("запись SLZ-контейнера");
@@ -788,8 +802,12 @@ fn slz_cmd(input: &str, output: &str, level: usize) {
         container.len(),
         dt.as_secs_f64()
     );
+    let dict_note = match &dict {
+        Some(d) => format!(" (словарь {} КиБ)", d.len() / 1024),
+        None => String::new(),
+    };
     eprintln!(
-        "slz{} {input}: {} Б → поток {} Б + конверт {} Б = {} Б ({:.2}×, {:.2} c)",
+        "slz{}{dict_note} {input}: {} Б → поток {} Б + конверт {} Б = {} Б ({:.2}×, {:.2} c)",
         if level == 6 {
             String::new()
         } else {
@@ -805,8 +823,8 @@ fn slz_cmd(input: &str, output: &str, level: usize) {
 }
 
 /// PS22: распаковка SLZ-контейнера (SU21 распознаётся, проверка до записи).
-/// Голый SLZ-поток без конверта тоже принимается.
-fn slz_decode_cmd(input: &str, output: &str) {
+/// Голый SLZ-поток без конверта тоже принимается. PS24.1: --dict для SLZ3.
+fn slz_decode_cmd(input: &str, output: &str, dict_path: Option<&String>) {
     let data = fs::read(input).expect("чтение SLZ-контейнера");
     let t0 = Instant::now();
     let (payload, wrapped) = match steno_uv::integrity::try_unwrap(&data) {
@@ -818,7 +836,14 @@ fn slz_decode_cmd(input: &str, output: &str) {
     } else {
         usize::MAX
     };
-    let raw = steno_uv::slz::decode(payload, limit).expect("slz декодирование");
+    let decoded = match dict_path {
+        Some(p) => {
+            let dict = fs::read(p).expect("чтение словаря");
+            steno_uv::slz::decode_dict(payload, &dict, limit)
+        }
+        None => steno_uv::slz::decode(payload, limit),
+    };
+    let raw = decoded.expect("slz декодирование");
     if wrapped {
         steno_uv::integrity::verify(&data, &raw).expect("конверт SU21: проверка целостности");
     }

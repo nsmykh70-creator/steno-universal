@@ -29,6 +29,15 @@ const EXACT: u32 = 16;
 const REP_SEL: u32 = 29;
 
 pub const MAGIC: &[u8; 4] = b"SLZ2";
+/// PS24.1: словарный режим. SLZ3 = `SLZ3` + uvarint(исходная длина) +
+/// uvarint(длина словаря) + uvarint(CRC-64 словаря) + uvarint(чанков) +
+/// чанки. Содержимое словаря в поток НЕ пишется — обе стороны передают
+/// его отдельно (--dict); энкодер прогревает хеш-цепочки словарём
+/// (prime-проход, эмиссии нет), совпадения могут ссылаться на хвост
+/// словаря (офсет больше позиции в выходе). Магия SLZ2 не переиспользуется,
+/// поэтому декодер PS23.4 честно отвергает SLZ3 («магия не SLZ2») —
+/// откат на старый релиз безопасен.
+pub const MAGIC3: &[u8; 4] = b"SLZ3";
 
 /// пресеты уровней скорости: (глубина цепочки, lazy-глубина, GOOD_LEN,
 /// lazy2 — проверять i+1 даже при уже найденном совпадении). Уровень 1 —
@@ -64,7 +73,9 @@ fn get_uvarint(data: &[u8], pos: &mut usize) -> Result<u64, &'static str> {
             return Ok(v);
         }
         shift += 7;
-        if shift > 56 {
+        // PS24.1: в заголовке SLZ3 едет CRC-64 словаря — полное u64 требует
+        // до 10 байт varint (старый лимит 56 бит резал старший бит хеша)
+        if shift > 63 {
             return Err("slz: varint слишком длинный");
         }
     }
@@ -327,6 +338,10 @@ struct Seq {
 /// поэтому дальние повторы через границу чанка находятся.
 struct Tok {
     head: Vec<u32>,
+    /// PS24.1: отдельная таблица кандидатов из словаря — цепочки входа не
+    /// загрязняются повторами словаря (как dictMatchState у zstd); пустая
+    /// вектор = режим без словаря, ноль накладных расходов
+    head_dict: Vec<u32>,
     prev: Vec<u32>,
     mtf: [u32; MTF_SLOTS],
     i: usize,
@@ -343,6 +358,7 @@ impl Tok {
     fn with_params(depth: usize, lazy_depth: usize, good_len: usize, lazy2: bool) -> Self {
         Tok {
             head: vec![NOPOS; 1usize << HASH_BITS],
+            head_dict: Vec::new(),
             prev: vec![NOPOS; WINDOW],
             mtf: [1, 2, 3, 4],
             i: 0,
@@ -352,6 +368,23 @@ impl Tok {
             good_len,
             lazy2,
         }
+    }
+
+    /// PS24.1: прогрев словарём — позиции в head_dict, эмиссии нет. Вставка
+    /// в обратном порядке: головой цепочки становится самая ранняя позиция
+    /// словаря (вход обычно ссылается на словарь в порядке роста записей).
+    fn prime(&mut self, data: &[u8], end: usize) {
+        if self.head_dict.is_empty() {
+            self.head_dict = vec![NOPOS; 1usize << HASH_BITS];
+        }
+        for i in (0..end).rev() {
+            if i + MINMATCH <= data.len() {
+                let h = hash4(data, i);
+                self.prev[i & (WINDOW - 1)] = self.head_dict[h];
+                self.head_dict[h] = i as u32;
+            }
+        }
+        self.i = end;
     }
 
     #[inline]
@@ -421,13 +454,28 @@ impl Tok {
         self.extend_len(input, p - off, p)
     }
 
-    /// лучший кандидат с позиции p: (len, off)
+    /// минимальная длина совпадения по расстоянию: дальние короткие
+    /// совпадения дороже литералов — офсет >1 МиБ должен покрыть ≥5 Б,
+    /// >4 МиБ — ≥8 Б, иначе кандидат пропускается
+    #[inline]
+    fn min_match_len(dist: usize) -> usize {
+        if dist > (1 << 22) {
+            8
+        } else if dist > (1 << 20) {
+            5
+        } else {
+            MINMATCH
+        }
+    }
+
+    /// лучший кандидат с позиции p: (len, off). Две цепочки: вход (head) и
+    /// словарь (head_dict, PS24.1).
     fn best_at(&self, input: &[u8], p: usize, depth: usize) -> (usize, usize) {
         if p + MINMATCH > input.len() {
             return (0, 0);
         }
-        let mut cand = self.head[hash4(input, p)];
         let (mut bl, mut bo) = (0usize, 0usize);
+        let mut cand = self.head[hash4(input, p)];
         let mut d = depth;
         while cand != NOPOS && d > 0 {
             let c = cand as usize;
@@ -435,15 +483,7 @@ impl Tok {
                 break;
             }
             let l = self.extend_len(input, c, p);
-            // дальние короткие совпадения дороже литералов: офсет >1 МиБ
-            // должен покрыть ≥6 Б, >4 МиБ — ≥8 Б, иначе кандидат пропускается
-            let minlen = if p - c > (1 << 22) {
-                8
-            } else if p - c > (1 << 20) {
-                5
-            } else {
-                MINMATCH
-            };
+            let minlen = Self::min_match_len(p - c);
             if l >= minlen && l > bl {
                 bl = l;
                 bo = p - c;
@@ -453,6 +493,27 @@ impl Tok {
             }
             cand = self.prev[c & (WINDOW - 1)];
             d -= 1;
+        }
+        if !self.head_dict.is_empty() {
+            let mut cand = self.head_dict[hash4(input, p)];
+            let mut d = depth;
+            while cand != NOPOS && d > 0 {
+                let c = cand as usize;
+                if p - c > WINDOW {
+                    break;
+                }
+                let l = self.extend_len(input, c, p);
+                let minlen = Self::min_match_len(p - c);
+                if l >= minlen && l > bl {
+                    bl = l;
+                    bo = p - c;
+                    if bl >= self.good_len {
+                        break;
+                    }
+                }
+                cand = self.prev[c & (WINDOW - 1)];
+                d -= 1;
+            }
         }
         (bl, bo)
     }
@@ -570,6 +631,52 @@ impl Tok {
 /// Кодирование полного SLZ-потока уровнем по умолчанию (без конверта SU21).
 pub fn encode(input: &[u8]) -> Vec<u8> {
     encode_level(input, 6)
+}
+
+/// PS24.1: кодирование со словарём (формат SLZ3). Словарь прогревает
+/// хеш-цепочки (prime-проход по dict без эмиссии последовательностей),
+/// после чего обычная токенизация входа находит совпадения, источники
+/// которых лежат в словаре. Офсеты — расстояния в виртуальном потоке
+/// `dict ++ input`, поэтому декодер при off > позиции выхода читает
+/// из хвоста словаря. Пустой вход или пустой словарь → обычный SLZ2.
+pub fn encode_dict(input: &[u8], dict: &[u8], level: usize) -> Vec<u8> {
+    if input.is_empty() || dict.is_empty() {
+        return encode_level(input, level);
+    }
+    let n = input.len();
+    let dn = dict.len();
+    let mut full = Vec::with_capacity(dn + n);
+    full.extend_from_slice(dict);
+    full.extend_from_slice(input);
+    let mut out = Vec::with_capacity(n / 2 + 64);
+    out.extend_from_slice(MAGIC3);
+    put_uvarint(n as u64, &mut out);
+    put_uvarint(dn as u64, &mut out);
+    put_uvarint(crate::integrity::crc64(dict), &mut out);
+    let nchunks = n.div_ceil(BLOCK).max(1);
+    put_uvarint(nchunks as u64, &mut out);
+    let (depth, lazy_depth, good_len, lazy2) = level_params(level);
+    let mut tok = Tok::with_params(depth, lazy_depth, good_len, lazy2);
+    // prime-проход: позиции словаря в отдельную таблицу head_dict (в
+    // обратном порядке), эмиссии нет — декодер имеет тот же словарь
+    tok.prime(&full, dn);
+    for _ in 0..nchunks {
+        let chunk_start = tok.i;
+        let target_end = (tok.i + BLOCK).min(dn + n);
+        let chunk_len = target_end - chunk_start;
+        let (lits, seqs) = tok.run_chunk(&full, target_end);
+        let mut enc = Vec::with_capacity(chunk_len / 2 + 512);
+        encode_chunk(&mut enc, &lits, &seqs);
+        if enc.len() < chunk_len {
+            out.push(0);
+            out.extend_from_slice(&enc);
+        } else {
+            out.push(1);
+            out.extend_from_slice(&full[chunk_start..target_end]);
+            tok.mtf = [1, 2, 3, 4];
+        }
+    }
+    out
 }
 
 /// Кодирование с уровнем скорости 1 (fast, конкурент lz4) … 19 (глубокие
@@ -697,13 +804,43 @@ fn encode_chunk(out: &mut Vec<u8>, lits: &[u8], seqs: &[Seq]) {
 /// Декодирование SLZ-потока. `max_output` — предел размера выхода;
 /// возвращает исходные байты.
 pub fn decode(data: &[u8], max_output: usize) -> Result<Vec<u8>, &'static str> {
-    if data.len() < 7 || &data[..4] != MAGIC {
-        return Err("slz: магия не SLZ2");
+    decode_stream(data, &[], max_output)
+}
+
+/// PS24.1: декодирование SLZ3-потока со словарём. Словарь проверяется
+/// по длине и CRC-64; совпадения с off > позиции выхода читаются из
+/// его хвоста.
+pub fn decode_dict(
+    data: &[u8],
+    dict: &[u8],
+    max_output: usize,
+) -> Result<Vec<u8>, &'static str> {
+    if dict.is_empty() {
+        return decode(data, max_output);
+    }
+    decode_stream(data, dict, max_output)
+}
+
+fn decode_stream(data: &[u8], dict: &[u8], max_output: usize) -> Result<Vec<u8>, &'static str> {
+    let dict_mode = !dict.is_empty();
+    if data.len() < 7 || &data[..4] != (if dict_mode { MAGIC3 } else { MAGIC }) {
+        return Err(if dict_mode {
+            "slz: магия не SLZ3"
+        } else {
+            "slz: магия не SLZ2"
+        });
     }
     let mut pos = 4usize;
     let orig_len = get_uvarint(data, &mut pos)? as usize;
     if orig_len > max_output {
         return Err("slz: заявленная длина превышает лимит");
+    }
+    if dict_mode {
+        let dict_len = get_uvarint(data, &mut pos)? as usize;
+        let dict_crc = get_uvarint(data, &mut pos)?;
+        if dict_len != dict.len() || crate::integrity::crc64(dict) != dict_crc {
+            return Err("slz: словарь не совпал (длина/CRC-64)");
+        }
     }
     let nchunks = get_uvarint(data, &mut pos)? as usize;
     let mut out: Vec<u8> = Vec::with_capacity(orig_len);
@@ -836,16 +973,37 @@ pub fn decode(data: &[u8], max_output: usize) -> Result<Vec<u8>, &'static str> {
                     (((1u32 << k) | (v & ((1 << k) - 1))) as usize)
                 };
                 let len = len_m + MINMATCH;
-                if off > out.len() {
-                    return Err("slz: офсет за пределами выхода");
-                }
                 if out.len() + len > orig_len {
                     return Err("slz: выход превышает заявленную длину");
                 }
-                let start = out.len() - off;
-                if off >= len {
+                if off > out.len() {
+                    // источник за пределами выхода — в словаре (PS24.1)
+                    if off > out.len() + dict.len() {
+                        return Err("slz: офсет за пределами словаря");
+                    }
+                    let from_dict = off - out.len();
+                    let base = out.len();
+                    let ds = dict.len() - from_dict;
+                    if from_dict >= len {
+                        // источник целиком в словаре — прямой копир
+                        out.extend_from_slice(&dict[ds..ds + len]);
+                    } else {
+                        // источник начинается в словаре и продолжается в
+                        // уже записанный выход: прогрессирующая копия,
+                        // источник растёт вместе с записью
+                        out.resize(base + len, 0);
+                        for k in 0..from_dict {
+                            out[base + k] = dict[ds + k];
+                        }
+                        for k in from_dict..len {
+                            out[base + k] = out[k - from_dict];
+                        }
+                    }
+                } else if off >= len {
+                    let start = out.len() - off;
                     out.extend_from_within(start..start + len);
                 } else {
+                    let start = out.len() - off;
                     // перекрывающийся повтор (off < len): off==1 — fill одним
                     // байтом; иначе u64-словами копируем первые off байт из
                     // исходных данных, хвост — из уже записанного участка
@@ -1075,5 +1233,94 @@ mod tests {
             v.extend_from_slice(&block);
         }
         rt(&v);
+    }
+
+    /// PS24.1 словарный режим: записи ссылаются на содержимое словаря;
+    /// словарь улучшает сжатие; без словаря и с чужим словарём — ошибки.
+    #[test]
+    fn dict_roundtrip_and_refs() {
+        let mut dict = Vec::new();
+        for k in 0..4000 {
+            dict.extend_from_slice(
+                format!(
+                    "{{\"key{k}\": \"value-{}-строка\", \"cat\": \"категория{}\"}}\n",
+                    k % 77,
+                    k % 13
+                )
+                .as_bytes(),
+            );
+        }
+        let mut input = Vec::new();
+        for k in 0..2000u32 {
+            input.extend_from_slice(
+                format!(
+                    "{{\"key{}\": \"value-{}-строка\", \"cat\": \"категория{}\", \"n\": {}}}\n",
+                    k % 4000,
+                    k % 77,
+                    k % 13,
+                    k
+                )
+                .as_bytes(),
+            );
+        }
+        let enc_nodict = encode_level(&input, 6);
+        let enc = encode_dict(&input, &dict, 6);
+        assert!(
+            enc.len() < enc_nodict.len(),
+            "словарь должен улучшать сжатие: {} против {}",
+            enc.len(),
+            enc_nodict.len()
+        );
+        let dec = decode_dict(&enc, &dict, input.len() + 1).expect("декод со словарём");
+        assert_eq!(dec, input);
+        assert!(
+            decode(&enc, input.len() + 1).is_err(),
+            "SLZ3 без словаря должен быть ошибкой"
+        );
+        let wrong: Vec<u8> = dict.iter().map(|&b| b.wrapping_add(1)).collect();
+        assert!(
+            decode_dict(&enc, &wrong, input.len() + 1).is_err(),
+            "словарь той же длины, но другой — должен отвергаться по CRC-64"
+        );
+    }
+
+    /// источник совпадения в хвосте словаря: целиком в словаре и
+    /// пересекающий границу dict→out (прогрессирующая копия, len > from_dict).
+    #[test]
+    fn dict_source_and_crossing() {
+        // целиком в словаре: dict кончается "0123456789", вход начинается им же
+        let dict = b"HEAD-HEAD-HEAD-0123456789".to_vec();
+        let input = b"0123456789XYZ-random-junk-0123456789XYZ".to_vec();
+        let enc = encode_dict(&input, &dict, 6);
+        let dec = decode_dict(&enc, &dict, input.len() + 1).expect("полный dict-источник");
+        assert_eq!(dec, input);
+
+        // пересечение границы: dict кончается "ABCAB", вход — период 5;
+        // энкодер находит матч off=5, источник = dict-хвост + рост из out
+        let dict2 = b"QWERTY-ABCAB".to_vec();
+        let input2 = b"ABCAB".repeat(20);
+        let enc2 = encode_dict(&input2, &dict2, 6);
+        let dec2 = decode_dict(&enc2, &dict2, input2.len() + 1).expect("пересечение dict→out");
+        assert_eq!(dec2, input2);
+    }
+
+    /// словарный режим на всех характерных уровнях (greedy, lazy, lazy2).
+    #[test]
+    fn dict_levels_roundtrip() {
+        let mut dict = Vec::new();
+        for k in 0..500 {
+            dict.extend_from_slice(format!("запись-{}-шаблон-категория{}\n", k % 40, k % 7).as_bytes());
+        }
+        let mut input = Vec::new();
+        for k in 0..600u32 {
+            input.extend_from_slice(
+                format!("запись-{}-шаблон-категория{} значение{}\n", k % 500, k % 7, k).as_bytes(),
+            );
+        }
+        for level in [1usize, 6, 19] {
+            let enc = encode_dict(&input, &dict, level);
+            let dec = decode_dict(&enc, &dict, input.len() + 1).expect("уровень");
+            assert_eq!(dec, input, "уровень {level}");
+        }
     }
 }
