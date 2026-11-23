@@ -14,7 +14,7 @@
 //! выровненным байтовым потоком в порядке следования.
 
 const MINMATCH: usize = 4;
-const MAXMATCH: usize = 65535;
+const MAXMATCH: usize = 1 << 20;
 const WINDOW: usize = 1 << 24;
 const BLOCK: usize = 1 << 20;
 const HASH_BITS: u32 = 22;
@@ -304,6 +304,26 @@ impl Tok {
         }
     }
 
+    /// вставка позиций совпадения в хеш-цепочки; при длинном совпадении
+    /// вставляем только края (по 16 позиций) — середина рана находит
+    /// совпадение через край, а на RLE-участках это экономит до 90%
+    /// вставок (иначе 1 МиБ нулей = 1 МиБ вставок)
+    #[inline]
+    fn insert_match(&mut self, input: &[u8], from: usize, len: usize) {
+        if len <= 32 {
+            for k in from..from + len {
+                self.insert(input, k);
+            }
+        } else {
+            for k in from..from + 16 {
+                self.insert(input, k);
+            }
+            for k in from + len - 16..from + len {
+                self.insert(input, k);
+            }
+        }
+    }
+
     /// лучший кандидат с позиции p: (len, off)
     fn best_at(&self, input: &[u8], p: usize, depth: usize) -> (usize, usize) {
         if p + MINMATCH > input.len() {
@@ -389,18 +409,14 @@ impl Tok {
                     self.insert(input, i);
                     self.i += 1;
                     self.emit(&mut seqs, o2, l2);
-                    for k in self.i..self.i + l2 {
-                        self.insert(input, k);
-                    }
+                    self.insert_match(input, self.i, l2);
                     self.i += l2;
                     continue;
                 }
             }
             if bl >= MINMATCH {
                 self.emit(&mut seqs, bo, bl);
-                for k in i..i + bl {
-                    self.insert(input, k);
-                }
+                self.insert_match(input, i, bl);
                 self.i += bl;
             } else {
                 lits.push(input[i]);
@@ -434,10 +450,11 @@ pub fn encode(input: &[u8]) -> Vec<u8> {
 }
 
 /// Частоты бакетов: раны литералов, селекторы, длины.
-fn seq_freqs(seqs: &[Seq]) -> ([u32; EXACT as usize + 25], [u32; 29], [u32; EXACT as usize + 17]) {
+fn seq_freqs(seqs: &[Seq]) -> ([u32; EXACT as usize + 25], [u32; 29], [u32; EXACT as usize + 22]) {
     let mut fr = [0u32; EXACT as usize + 25];
     let mut fs = [0u32; 29];
-    let mut fl = [0u32; EXACT as usize + 17];
+    // len_m до MAXMATCH-4 → log до 20 → символ EXACT+20=36; запас до 21
+    let mut fl = [0u32; EXACT as usize + 22];
     for s in seqs {
         fr[bucket(s.run).0 as usize] += 1;
         fs[s.sel as usize] += 1;
@@ -647,10 +664,29 @@ pub fn decode(data: &[u8], max_output: usize) -> Result<Vec<u8>, &'static str> {
                 if off >= len {
                     out.extend_from_within(start..start + len);
                 } else {
-                    // перекрывающийся повтор (RLE-подобные участки)
-                    for k in 0..len {
-                        let b = out[start + k];
-                        out.push(b);
+                    // перекрывающийся повтор (off < len): off==1 — fill одним
+                    // байтом; иначе u64-словами копируем первые off байт из
+                    // исходных данных, хвост — из уже записанного участка
+                    let base = out.len();
+                    if off == 1 {
+                        let b = out[start];
+                        out.resize(base + len, b);
+                    } else {
+                        out.resize(base + len, 0);
+                        let mut k = 0usize;
+                        while k + 8 <= off {
+                            out.copy_within(start + k..start + k + 8, base + k);
+                            k += 8;
+                        }
+                        while k < off {
+                            out[base + k] = out[start + k];
+                            k += 1;
+                        }
+                        while k < len {
+                            let nn = (len - k).min(off).min(8);
+                            out.copy_within(base + k - off..base + k - off + nn, base + k);
+                            k += nn;
+                        }
                     }
                 }
             }
@@ -751,6 +787,20 @@ mod tests {
     #[test]
     fn overlapping_matches_reconstruct_rle() {
         let v = vec![5u8; 10_000]; // сплошной перекрывающийся повтор
+        rt(&v);
+    }
+
+    #[test]
+    fn runs_longer_than_64k() {
+        // раны > прежнего предела MAXMATCH=65535: чередование проверяет
+        // и разбиение длинных совпадений на токены, и «редкие вставки»
+        let mut v = Vec::new();
+        for _ in 0..3 {
+            v.extend(std::iter::repeat(b'a').take(70_000));
+            v.extend_from_slice(b"SEP\n");
+            v.extend(std::iter::repeat(b' ').take(130_000));
+            v.extend_from_slice(b";");
+        }
         rt(&v);
     }
 }
