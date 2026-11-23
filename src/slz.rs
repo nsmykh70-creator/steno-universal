@@ -42,13 +42,16 @@ pub const MAGIC3: &[u8; 4] = b"SLZ3";
 /// пресеты уровней скорости: (глубина цепочки, lazy-глубина, GOOD_LEN,
 /// lazy2 — проверять i+1 даже при уже найденном совпадении). Уровень 1 —
 /// greedy без lazy (прямой конкурент lz4), 6 — дефолт PS23.2.
-fn level_params(level: usize) -> (usize, usize, usize, bool) {
+fn level_params(level: usize) -> (usize, usize, usize, bool, usize) {
+    // 5-й элемент — accel (PS24.3): стартовый шаг пропуска позиций при
+    // промахе поиска (LZ4-style), растёт на 1 за каждые 64 промаха
+    // подряд; 0 = выключен (высокие уровни ищут каждую позицию)
     match level {
-        0 | 1 => (8, 0, 16, false),
-        2 | 3 => (16, 8, 24, false),
-        4..=9 => (32, 16, 48, false),
-        10..=14 => (64, 32, 96, true),
-        _ => (128, 48, 256, true),
+        0 | 1 => (8, 0, 16, false, 4),
+        2 | 3 => (16, 8, 24, false, 2),
+        4..=9 => (32, 16, 48, false, 1),
+        10..=14 => (64, 32, 96, true, 0),
+        _ => (128, 48, 256, true, 0),
     }
 }
 
@@ -125,10 +128,29 @@ impl<'a> BitReader<'a> {
     }
     #[inline]
     fn refill(&mut self) {
-        while self.nbits <= 56 && self.pos < self.data.len() {
-            self.acc = (self.acc << 8) | self.data[self.pos] as u64;
-            self.pos += 1;
-            self.nbits += 8;
+        if self.nbits > 56 {
+            return;
+        }
+        // PS24.3: 8 байт одной unaligned-загрузкой вместо побайтового
+        // цикла (до 7 итераций с проверкой границ на каждый символ —
+        // главная цена декода после таблицы). В очередь добавляем
+        // (64-nbits)/8 байт целиком: nbits ≤ 56 → 1..8 байт без
+        // переполнения; у конца потока — прежний побайтовый путь.
+        let len = self.data.len();
+        if self.pos + 8 <= len {
+            let w = unsafe {
+                (self.data.as_ptr().add(self.pos) as *const [u8; 8]).read_unaligned()
+            };
+            let bits = ((64 - self.nbits) >> 3) * 8;
+            self.acc = (self.acc << bits) | (u64::from_be_bytes(w) >> (64 - bits));
+            self.nbits += bits;
+            self.pos += (bits >> 3) as usize;
+        } else {
+            while self.nbits <= 56 && self.pos < len {
+                self.acc = (self.acc << 8) | self.data[self.pos] as u64;
+                self.pos += 1;
+                self.nbits += 8;
+            }
         }
     }
     #[inline]
@@ -480,6 +502,10 @@ struct Tok {
     good_len: usize,
     /// lazy2: lazy-проверка i+1 даже при найденном совпадении (уровни 12+)
     lazy2: bool,
+    /// PS24.3: стартовый шаг пропуска при промахе поиска (0 = выключен)
+    accel: usize,
+    /// счётчик промахов подряд (шаг пропуска растёт с ним)
+    miss_run: u32,
 }
 
 impl Tok {
@@ -489,6 +515,7 @@ impl Tok {
         good_len: usize,
         lazy2: bool,
         prev_size: usize,
+        accel: usize,
     ) -> Self {
         Tok {
             head: vec![NOPOS; 1usize << HASH_BITS],
@@ -502,6 +529,8 @@ impl Tok {
             lazy_depth,
             good_len,
             lazy2,
+            accel,
+            miss_run: 0,
         }
     }
 
@@ -705,6 +734,7 @@ impl Tok {
                 self.emit_rep(&mut seqs, rl);
                 self.insert_match(input, i, rl);
                 self.i += rl;
+                self.miss_run = 0;
                 continue;
             }
             let (bl, bo) = self.best_at(input, i, self.depth);
@@ -746,6 +776,7 @@ impl Tok {
                     self.emit(&mut seqs, o2, l2);
                     self.insert_match(input, self.i, l2);
                     self.i += l2;
+                    self.miss_run = 0;
                     continue;
                 }
             }
@@ -753,11 +784,29 @@ impl Tok {
                 self.emit(&mut seqs, bo, bl);
                 self.insert_match(input, i, bl);
                 self.i += bl;
+                self.miss_run = 0;
             } else {
-                lits.push(input[i]);
-                self.lit_run += 1;
+                // промах: позиция i — литерал; PS24.3: LZ4-style accel —
+                // следующие step позиций пропускаем без поиска и без
+                // вставки в цепочки (шаг растёт на 1 за каждые 64 промаха
+                // подряд, сбрасывается совпадением; на несжимаемых участках
+                // поиск выключается почти полностью)
+                self.miss_run += 1;
+                let skip = if self.accel > 0 {
+                    (self.accel + (self.miss_run >> 6) as usize).min(n - i)
+                } else {
+                    1
+                };
                 self.insert(input, i);
-                self.i += 1;
+                if skip > 1 {
+                    lits.extend_from_slice(&input[i..i + skip]);
+                    self.lit_run += skip as u32;
+                    self.i += skip;
+                } else {
+                    lits.push(input[i]);
+                    self.lit_run += 1;
+                    self.i += 1;
+                }
             }
         }
         // хвостовые литералы чанка идут в «хвост» этого же чанка (декодер
@@ -794,11 +843,11 @@ pub fn encode_dict(input: &[u8], dict: &[u8], level: usize) -> Vec<u8> {
     put_uvarint(crate::integrity::crc64(dict), &mut out);
     let nchunks = n.div_ceil(BLOCK).max(1);
     put_uvarint(nchunks as u64, &mut out);
-    let (depth, lazy_depth, good_len, lazy2) = level_params(level);
+    let (depth, lazy_depth, good_len, lazy2, accel) = level_params(level);
     // PS24.2: кольцо prev — степень двойки от длины (dict + вход);
     // для файлов ≤16 МиБ это идентично WINDOW-кольцу без перезаписей
     let prev_size = (dn + n).next_power_of_two().min(WINDOW);
-    let mut tok = Tok::with_params(depth, lazy_depth, good_len, lazy2, prev_size);
+    let mut tok = Tok::with_params(depth, lazy_depth, good_len, lazy2, prev_size, accel);
     // prime-проход: позиции словаря в отдельную таблицу head_dict (в
     // обратном порядке), эмиссии нет — декодер имеет тот же словарь
     tok.prime(&full, dn);
@@ -816,6 +865,13 @@ pub fn encode_dict(input: &[u8], dict: &[u8], level: usize) -> Vec<u8> {
             out.push(1);
             out.extend_from_slice(&full[chunk_start..target_end]);
             tok.mtf = [1, 2, 3, 4];
+            // raw-чанк декодер копирует ровно [chunk_start, target_end);
+            // токенизатор мог уйти дальше (пересекающийся матч или шаг
+            // accel-пропуска, PS24.3) — перебег живёт только в выброшенных
+            // литералах, поэтому откатываем позицию: перебег ретокенизируется
+            // следующим чанком (иначе энкодер и декодер расходятся ровно
+            // на величину перебега — m10, «обрыв raw-чанка»)
+            tok.i = target_end;
         }
     }
     out
@@ -830,10 +886,10 @@ pub fn encode_level(input: &[u8], level: usize) -> Vec<u8> {
     put_uvarint(n as u64, &mut out);
     let nchunks = n.div_ceil(BLOCK).max(1);
     put_uvarint(nchunks as u64, &mut out);
-    let (depth, lazy_depth, good_len, lazy2) = level_params(level);
+    let (depth, lazy_depth, good_len, lazy2, accel) = level_params(level);
     // PS24.2: кольцо prev — степень двойки от длины входа (см. Tok.mask)
     let prev_size = n.next_power_of_two().min(WINDOW);
-    let mut tok = Tok::with_params(depth, lazy_depth, good_len, lazy2, prev_size);
+    let mut tok = Tok::with_params(depth, lazy_depth, good_len, lazy2, prev_size, accel);
     for _ in 0..nchunks {
         let chunk_start = tok.i;
         let target_end = (tok.i + BLOCK).min(n);
@@ -849,8 +905,10 @@ pub fn encode_level(input: &[u8], level: usize) -> Vec<u8> {
         } else {
             out.push(1);
             out.extend_from_slice(&input[chunk_start..target_end]);
-            // токены этого чанка выброшены — ресет MTF синхронен декодеру
+            // токены этого чанка выброшены — ресет MTF синхронен декодеру;
+            // откат позиции при перебеге токенизатора (см. encode_level)
             tok.mtf = [1, 2, 3, 4];
+            tok.i = target_end;
         }
     }
     out
@@ -1532,6 +1590,23 @@ mod huff2lv {
         }
         let enc = encode(&v);
         assert_eq!(decode(&enc, v.len()).unwrap(), v);
+    }
+
+    /// PS24.3: перебег токенизатора через границу чанка + raw-escape
+    /// следующего чанка: пересекающий матч и accel-шаг не должны уводить
+    /// энкодер и декодер врозь (на m10 это было «обрыв raw-чанка»)
+    #[test]
+    fn raw_escape_after_crossing_boundary() {
+        // паттерн, продолжающийся на 20+ байт за границу чанка 1→2:
+        // матч у границы пересекает target_end, токенизатор уходит за него
+        let mut v = b"abcdefgh01234567".repeat((2 * BLOCK + 32) / 16);
+        // дальше несжимаемые данные: чанки 2+ → raw-escape
+        let n = (BLOCK * 3 / 4) * 4;
+        v.extend((0..n).map(|i| (i as u64 * 6364136223846793005 >> 33) as u8));
+        for lv in [1usize, 6, 12] {
+            let e = encode_level(&v, lv);
+            assert_eq!(decode(&e, v.len()).unwrap(), v, "уровень {lv}");
+        }
     }
 
     /// бисекция: экстремальный перекос — коды len 1 и len 15 вместе + RLE
