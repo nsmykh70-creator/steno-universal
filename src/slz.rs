@@ -30,15 +30,16 @@ const REP_SEL: u32 = 29;
 
 pub const MAGIC: &[u8; 4] = b"SLZ2";
 
-/// пресеты уровней скорости: (глубина цепочки, lazy-глубина, GOOD_LEN).
-/// Уровень 1 — greedy без lazy (прямой конкурент lz4), 6 — дефолт PS23.2.
-fn level_params(level: usize) -> (usize, usize, usize) {
+/// пресеты уровней скорости: (глубина цепочки, lazy-глубина, GOOD_LEN,
+/// lazy2 — проверять i+1 даже при уже найденном совпадении). Уровень 1 —
+/// greedy без lazy (прямой конкурент lz4), 6 — дефолт PS23.2.
+fn level_params(level: usize) -> (usize, usize, usize, bool) {
     match level {
-        0 | 1 => (8, 0, 16),
-        2 | 3 => (16, 8, 24),
-        4..=9 => (32, 16, 48),
-        10..=14 => (64, 24, 96),
-        _ => (128, 32, 256),
+        0 | 1 => (8, 0, 16, false),
+        2 | 3 => (16, 8, 24, false),
+        4..=9 => (32, 16, 48, false),
+        10..=14 => (64, 32, 96, true),
+        _ => (128, 48, 256, true),
     }
 }
 
@@ -334,10 +335,12 @@ struct Tok {
     depth: usize,
     lazy_depth: usize,
     good_len: usize,
+    /// lazy2: lazy-проверка i+1 даже при найденном совпадении (уровни 12+)
+    lazy2: bool,
 }
 
 impl Tok {
-    fn with_params(depth: usize, lazy_depth: usize, good_len: usize) -> Self {
+    fn with_params(depth: usize, lazy_depth: usize, good_len: usize, lazy2: bool) -> Self {
         Tok {
             head: vec![NOPOS; 1usize << HASH_BITS],
             prev: vec![NOPOS; WINDOW],
@@ -347,6 +350,7 @@ impl Tok {
             depth,
             lazy_depth,
             good_len,
+            lazy2,
         }
     }
 
@@ -431,7 +435,16 @@ impl Tok {
                 break;
             }
             let l = self.extend_len(input, c, p);
-            if l > bl {
+            // дальние короткие совпадения дороже литералов: офсет >1 МиБ
+            // должен покрыть ≥6 Б, >4 МиБ — ≥8 Б, иначе кандидат пропускается
+            let minlen = if p - c > (1 << 22) {
+                8
+            } else if p - c > (1 << 20) {
+                5
+            } else {
+                MINMATCH
+            };
+            if l >= minlen && l > bl {
                 bl = l;
                 bo = p - c;
                 if bl >= self.good_len {
@@ -499,15 +512,31 @@ impl Tok {
                 continue;
             }
             let (bl, bo) = self.best_at(input, i, self.depth);
-            if rl >= MINMATCH && rl > bl {
+            // rep0 против кандидата. Стоимость обычного офсета ~log2(off)
+            // экстра-бит, литерал ~5.5 бит, но близкий тай-брейк rep'ом
+            // фрагментирует длинные матчи (замер fb2: enc −32%) — поэтому:
+            // rep берём при равной длине (та же покрышка, минус символ) и
+            // при кандидатe лишь незначительно длиннее, но только если
+            // кандидат ДАЛЁКИЙ (off > 64 КиБ, где экстра-бит много)
+            let rep_wins = rl >= MINMATCH
+                && (bl < rl
+                    || (bl == rl && bo > 0)
+                    || (bo > (1 << 16)
+                        && bl < rl + (32 - (bo as u32).leading_zeros() as usize + 3) / 5));
+            if rep_wins {
                 // слабый rep0 — берём, только если он длиннее кандидата
                 self.emit_rep(&mut seqs, rl);
                 self.insert_match(input, i, rl);
                 self.i += rl;
                 continue;
             }
-            // lazy-1: короткое совпадение — проверяем позицию i+1
-            if self.lazy_depth > 0 && bl < self.good_len && i + 1 + MINMATCH <= n {
+            // lazy-1: короткое совпадение — проверяем позицию i+1; lazy2
+            // (высокие уровни) проверяет i+1 и при найденном совпадении:
+            // длинный матч может блокировать ещё более длинный шагом дальше
+            if self.lazy_depth > 0
+                && (self.lazy2 || bl < self.good_len)
+                && i + 1 + MINMATCH <= n
+            {
                 let (l2, o2) = self.best_at(input, i + 1, self.lazy_depth);
                 if l2 >= MINMATCH && l2 > bl {
                     lits.push(input[i]);
@@ -552,8 +581,8 @@ pub fn encode_level(input: &[u8], level: usize) -> Vec<u8> {
     put_uvarint(n as u64, &mut out);
     let nchunks = n.div_ceil(BLOCK).max(1);
     put_uvarint(nchunks as u64, &mut out);
-    let (depth, lazy_depth, good_len) = level_params(level);
-    let mut tok = Tok::with_params(depth, lazy_depth, good_len);
+    let (depth, lazy_depth, good_len, lazy2) = level_params(level);
+    let mut tok = Tok::with_params(depth, lazy_depth, good_len, lazy2);
     for _ in 0..nchunks {
         let chunk_start = tok.i;
         let target_end = (tok.i + BLOCK).min(n);
