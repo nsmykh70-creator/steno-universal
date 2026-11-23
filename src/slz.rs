@@ -259,10 +259,45 @@ fn bucket(value: u32) -> (u32, u32, u32) {
     }
 }
 
+/// CRC32-инструкция (sse4.2) даёт более равномерное распределение и
+/// дешевле умножения; без sse4.2 — multiply-shift fallback.
+#[cfg(target_arch = "x86_64")]
+static SSE42: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_sse42() -> bool {
+    *SSE42.get_or_init(|| std::arch::is_x86_feature_detected!("sse4.2"))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn crc32_u32(v: u32) -> u32 {
+    core::arch::x86_64::_mm_crc32_u32(0, v)
+}
+
+/// prefetch (T0): идея проверена замерами и отклонена — на глубокой
+/// цепочке кандидатов fb2 он давал +8…15% ко времени enc (данные почти
+/// всегда уже в кэше, а инструкции prefetch стоят тактов). Функция
+/// удалена; CRC32-хеш и unchecked-загрузки остались.
+
 #[inline]
 fn hash4(data: &[u8], i: usize) -> usize {
+    debug_assert!(i + 4 <= data.len());
     let v = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
-    (v.wrapping_mul(2654435761) >> (32 - HASH_BITS)) as usize
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_sse42() {
+            // crc32 — биекция на u32, любые биты распределены равномерно
+            (unsafe { crc32_u32(v) } >> (32 - HASH_BITS)) as usize
+        } else {
+            (v.wrapping_mul(2654435761) >> (32 - HASH_BITS)) as usize
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        (v.wrapping_mul(2654435761) >> (32 - HASH_BITS)) as usize
+    }
 }
 
 struct Seq {
@@ -338,11 +373,17 @@ impl Tok {
                 break;
             }
             let maxlen = (input.len() - p).min(MAXMATCH);
-            // сравнение u64-словами: 8 байт за шаг, хвост — побайтово
+            // сравнение u64-словами: 8 байт за шаг, хвост — побайтово;
+            // границы доказаны: p+maxlen <= n, c < p => c+maxlen < n
+            debug_assert!(c < p && p + maxlen <= input.len());
             let mut l = 0usize;
             while l + 8 <= maxlen {
-                let a = u64::from_le_bytes(input[c + l..c + l + 8].try_into().unwrap());
-                let b = u64::from_le_bytes(input[p + l..p + l + 8].try_into().unwrap());
+                let a = u64::from_le_bytes(unsafe {
+                    (input.as_ptr().add(c + l) as *const [u8; 8]).read_unaligned()
+                });
+                let b = u64::from_le_bytes(unsafe {
+                    (input.as_ptr().add(p + l) as *const [u8; 8]).read_unaligned()
+                });
                 let x = a ^ b;
                 if x == 0 {
                     l += 8;
@@ -802,5 +843,40 @@ mod tests {
             v.extend_from_slice(b";");
         }
         rt(&v);
+    }
+
+    /// Живое сравнение с lz4/snappy (зависимости в Cargo.toml существуют
+    /// только для бенчей и не влияют на формат): смешанные данные ~768 КиБ
+    /// (RLE + текстовый паттерн + периодика + псевдослучайное); печатает
+    /// таблицу размеров, проверяет roundtrip и «не хуже худшего из
+    /// fast-конкурентов».
+    #[test]
+    fn live_codec_comparison() {
+        let mut v = Vec::with_capacity(1 << 20);
+        v.extend(std::iter::repeat(0u8).take(1 << 16)); // RLE
+        v.extend(
+            b"the quick brown fox jumps over the lazy dog. "
+                .iter()
+                .cycle()
+                .take(1 << 17),
+        ); // текстовый паттерн
+        v.extend((0u32..(1 << 19)).map(|i| (i.wrapping_mul(2654435761) % 251) as u8)); // периодика
+        v.extend((0u64..(1 << 18)).map(|i| (i.wrapping_mul(6364136223846793005) >> 33) as u8)); // псевдослучайное
+        let slz = encode(&v);
+        let lz4 = lz4_flex::compress_prepend_size(&v);
+        let snappy = snap::raw::Encoder::new().compress_vec(&v).unwrap();
+        let pct = |b: usize| b as f64 * 100.0 / v.len() as f64;
+        println!("live_codec_comparison: вход {} Б", v.len());
+        println!("  slz:    {} Б ({:.1}%)", slz.len(), pct(slz.len()));
+        println!("  lz4:    {} Б ({:.1}%)", lz4.len(), pct(lz4.len()));
+        println!("  snappy: {} Б ({:.1}%)", snappy.len(), pct(snappy.len()));
+        assert_eq!(decode(&slz, v.len()).unwrap(), v, "slz roundtrip");
+        let worst = lz4.len().max(snappy.len());
+        assert!(
+            slz.len() <= worst,
+            "slz ({}) не должен быть хуже худшего fast-кодека ({}) на смешанных данных",
+            slz.len(),
+            worst
+        );
     }
 }

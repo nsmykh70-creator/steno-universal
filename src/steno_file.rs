@@ -663,13 +663,15 @@ fn bench_s20_cmd(input: &str, flags: &[String]) {
         let _ = run_filter("xz", &["-c"], &raw);
         let _ = run_filter("gzip", &["-c"], &raw);
     }
-    for (codec_name, enc_args, dec_args) in [
-        ("xz", &["-c"][..], &["-d", "-c"][..]),
-        ("gzip", &["-c"][..], &["-d", "-c"][..]),
-        ("zstd", &["-q", "-c"][..], &["-q", "-d", "-c"][..]),
+    for (codec_name, binary, enc_args, dec_args) in [
+        ("xz", "xz", &["-c"][..], &["-d", "-c"][..]),
+        ("gzip", "gzip", &["-c"][..], &["-d", "-c"][..]),
+        // zstd: явные уровни 3 (дефолт CLI) и 19 (максимальное сжатие)
+        ("zstd-3", "zstd", &["-q", "-3", "-c"][..], &["-q", "-d", "-c"][..]),
+        ("zstd-19", "zstd", &["-q", "-19", "-c"][..], &["-q", "-d", "-c"][..]),
     ] {
         let t0 = Instant::now();
-        let compressed = match run_filter(codec_name, &enc_args, &raw) {
+        let compressed = match run_filter(binary, &enc_args, &raw) {
             Some(c) => c,
             None => {
                 eprintln!("SKIP: {codec_name} недоступен или не сжал {name}");
@@ -678,12 +680,40 @@ fn bench_s20_cmd(input: &str, flags: &[String]) {
         };
         let enc = t0.elapsed();
         let t0 = Instant::now();
-        let verified = match run_filter(codec_name, &dec_args, &compressed) {
+        let verified = match run_filter(binary, &dec_args, &compressed) {
             Some(d) => d == raw,
             None => false,
         };
         let dec = t0.elapsed();
         row(codec_name, compressed.len(), speed(enc), speed(dec), verified);
+    }
+
+    // --- lz4 и snappy: чистые Rust-порты, сравнение в этом же процессе
+    // (без накладных расходов subprocess, «на лету» как SLZ) ---
+    {
+        let t0 = Instant::now();
+        let compressed = lz4_flex::compress_prepend_size(&raw);
+        let enc = t0.elapsed();
+        let t0 = Instant::now();
+        let verified = lz4_flex::decompress_size_prepended(&compressed)
+            .map(|d| d == raw)
+            .unwrap_or(false);
+        let dec = t0.elapsed();
+        row("lz4", compressed.len(), speed(enc), speed(dec), verified);
+    }
+    {
+        let mut se = snap::raw::Encoder::new();
+        let t0 = Instant::now();
+        let compressed = se.compress_vec(&raw).expect("snappy encode");
+        let enc = t0.elapsed();
+        let mut sd = snap::raw::Decoder::new();
+        let t0 = Instant::now();
+        let verified = sd
+            .decompress_vec(&compressed)
+            .map(|out| out == raw)
+            .unwrap_or(false);
+        let dec = t0.elapsed();
+        row("snappy", compressed.len(), speed(enc), speed(dec), verified);
     }
 }
 

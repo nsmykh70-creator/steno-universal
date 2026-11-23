@@ -17,6 +17,12 @@ path = "src/main.rs"
 name = "steno_file"
 path = "src/steno_file.rs"
 
+[dependencies]
+# ТОЛЬКО для живых сравнений в bench-s20/тестах (чистые Rust-порты,
+# без unsafe): формат SLZ и его корректность от них не зависят.
+lz4_flex = "0.14"
+snap = "1"
+
 [profile.release]
 lto = true
 codegen-units = 1
