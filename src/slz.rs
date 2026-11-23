@@ -153,7 +153,41 @@ impl<'a> BitReader<'a> {
         self.acc &= (1u64 << self.nbits) - 1;
     }
     #[inline]
-    fn decode_sym(&mut self, table: &[u16]) -> Result<u8, &'static str> {
+    fn decode_sym(&mut self, table: &DecodeTable) -> Result<u8, &'static str> {
+        let snap = (self.acc, self.nbits, self.pos);
+        let r = self.decode_sym_new(table);
+        #[cfg(test)]
+        if let Some(full) = &table.full {
+            let post = (self.acc, self.nbits, self.pos);
+            self.acc = snap.0;
+            self.nbits = snap.1;
+            self.pos = snap.2;
+            let old = self.decode_sym_full(full);
+            let fullpost = (self.acc, self.nbits, self.pos);
+            // позиции могут расходиться на фазу refill (лишний байт в acc) —
+            // сравниваем только фактически потреблённые биты
+            let c_new = post.2 as i64 * 8 - post.1 as i64;
+            let c_old = fullpost.2 as i64 * 8 - fullpost.1 as i64;
+            if r != old || c_new != c_old {
+                let (a, nb, p) = snap;
+                let mut probe = BitReader { data: self.data, pos: p, acc: a, nbits: nb };
+                let idx10 = probe.peek(10);
+                let e10 = table.fast[idx10 as usize];
+                let mut probe2 = BitReader { data: self.data, pos: p, acc: a, nbits: nb };
+                let idx15 = probe2.peek(15);
+                let e15 = full[idx15 as usize];
+                panic!(
+                    "расхождение: r={r:?} old={old:?} idx10={idx10:#x} fast={e10:#06x} idx15={idx15:#x} full={e15:#06x}"
+                );
+            }
+            self.acc = post.0;
+            self.nbits = post.1;
+            self.pos = post.2;
+        }
+        r
+    }
+
+    fn decode_sym_full(&mut self, table: &[u16]) -> Result<u8, &'static str> {
         let packed = table[self.peek(MAX_CODE_LEN) as usize];
         let len = (packed & 0xF) as u32;
         if len == 0 {
@@ -161,6 +195,33 @@ impl<'a> BitReader<'a> {
         }
         self.consume(len);
         Ok((packed >> 4) as u8)
+    }
+
+    fn decode_sym_new(&mut self, table: &DecodeTable) -> Result<u8, &'static str> {
+        // PS24.2: двухуровневая схема — короткие коды (≤10 бит) за один
+        // lookup в fast-таблице 2^10 (в L1); длинные — 10 бит → индекс
+        // под-таблицы, ещё 5 бит → символ. Старая таблица 2^15 (64 КиБ ×3)
+        // жила в L2 и давала промах на каждый символ.
+        let e = table.fast[self.peek(10) as usize];
+        if e & 0x8000 == 0 {
+            let len = (e & 0xF) as u32;
+            if len == 0 {
+                return Err("slz: недопустимый код Хаффмана");
+            }
+            self.consume(len);
+            return Ok((e >> 4) as u8);
+        }
+        self.consume(10);
+        let e2 = table.subs[(e & 0x7FFF) as usize][self.peek(5) as usize];
+        let len = (e2 & 0xF) as u32;
+        if len == 0 {
+            return Err("slz: недопустимый код Хаффмана");
+        }
+        // десяток бит уже потреблён — добираем только остаток кода
+        // (consume(len) здесь рассинхронизировал поток на 10 бит
+        // на каждом длинном коде; поймано кросс-проверкой таблиц)
+        self.consume(len - 10);
+        Ok((e2 >> 4) as u8)
     }
 }
 
@@ -256,8 +317,18 @@ fn canonical_codes(lens: &[u8]) -> Vec<u32> {
     codes
 }
 
-/// Таблица декодирования: 2^15 входов (sym << 4 | len), один lookup на символ.
-fn decode_table(lens: &[u8], codes: &[u32]) -> Vec<u16> {
+/// Таблица декодирования PS24.2: fast 2^10 входов для кодов ≤10 бит
+/// (sym << 4 | len; старший бит 0x8000 — ссылка на под-таблицу) и
+/// под-таблицы 2^5 для длинных кодов 11–15 бит (индекс — следующие 5 бит).
+/// Рабочий набор ~2 КиБ вместо 64 КиБ — весь decode_sym из L1.
+struct DecodeTable {
+    fast: Vec<u16>,
+    subs: Vec<Vec<u16>>,
+    /// только в тестах: старая полная 2^15 таблица для кросс-проверки
+    full: Option<Vec<u16>>,
+}
+
+fn build_full_table(lens: &[u8], codes: &[u32]) -> Vec<u16> {
     let mut table = vec![0u16; 1usize << MAX_CODE_LEN];
     for (s, &len) in lens.iter().enumerate() {
         if len == 0 {
@@ -269,6 +340,53 @@ fn decode_table(lens: &[u8], codes: &[u32]) -> Vec<u16> {
         table[start..end].fill(((s as u16) << 4) | len as u16);
     }
     table
+}
+
+fn decode_table(lens: &[u8], codes: &[u32]) -> DecodeTable {
+    let mut fast = vec![0u16; 1usize << 10];
+    let mut subs: Vec<Vec<u16>> = Vec::new();
+    let mut prefixes: Vec<(u32, u16)> = Vec::new(); // (prefix10, индекс)
+    for (s, &len) in lens.iter().enumerate() {
+        if len == 0 {
+            continue;
+        }
+        let len = len as u32;
+        if len <= 10 {
+            let shift = 10 - len;
+            let start = (codes[s] << shift) as usize;
+            let end = start + (1usize << shift);
+            fast[start..end].fill(((s as u16) << 4) | len as u16);
+        } else {
+            let prefix = (codes[s] >> (len - 10)) as usize;
+            let idx = match prefixes.iter().find(|(p, _)| *p as usize == prefix) {
+                Some((_, i)) => *i,
+                None => {
+                    let i = subs.len() as u16;
+                    subs.push(vec![0u16; 1 << 5]);
+                    prefixes.push((prefix as u32, i));
+                    // fast индексируется 10 битами peek — один вход на префикс
+                    fast[prefix] = 0x8000 | i;
+                    i
+                }
+            };
+            // оставшиеся биты кода (len-10 ≤ 5), дополненные нулями снизу:
+            // индекс в под-таблице = следующие 5 бит потока
+            let low = (codes[s] & ((1u32 << (len - 10)) - 1)) as usize;
+            let shift2 = MAX_CODE_LEN - len; // 0..4
+            let start2 = low << shift2;
+            let end2 = start2 + (1usize << shift2);
+            subs[idx as usize][start2..end2].fill(((s as u16) << 4) | len as u16);
+        }
+    }
+    DecodeTable {
+        fast,
+        subs,
+        full: if cfg!(test) {
+            Some(build_full_table(lens, codes))
+        } else {
+            None
+        },
+    }
 }
 
 /// Разложение значения на символ Хаффмана и экстра-биты:
@@ -309,7 +427,12 @@ unsafe fn crc32_u32(v: u32) -> u32 {
 #[inline]
 fn hash4(data: &[u8], i: usize) -> usize {
     debug_assert!(i + 4 <= data.len());
-    let v = u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+    // PS24.2: unchecked-загрузка — границы доказаны вызывающими
+    // (insert/best_at/prime проверяют i+4 ≤ len); срез data[i..i+4]
+    // стоил проверку границ на каждый вызов хеша
+    let v = u32::from_le_bytes(unsafe {
+        (data.as_ptr().add(i) as *const [u8; 4]).read_unaligned()
+    });
     #[cfg(target_arch = "x86_64")]
     {
         if has_sse42() {
@@ -343,6 +466,11 @@ struct Tok {
     /// вектор = режим без словаря, ноль накладных расходов
     head_dict: Vec<u32>,
     prev: Vec<u32>,
+    /// PS24.2: маска кольца prev = prev.len() - 1. Кольцо ужато до
+    /// степени двойки ≥ длины входа: для файлов ≤16 МиБ ни один слот
+    /// не перезаписывается — поведение идентично WINDOW-кольцу, а CLI
+    /// на малых файлах ест память по размеру данных, а не 64 МиБ всегда
+    mask: usize,
     mtf: [u32; MTF_SLOTS],
     i: usize,
     lit_run: u32,
@@ -355,11 +483,18 @@ struct Tok {
 }
 
 impl Tok {
-    fn with_params(depth: usize, lazy_depth: usize, good_len: usize, lazy2: bool) -> Self {
+    fn with_params(
+        depth: usize,
+        lazy_depth: usize,
+        good_len: usize,
+        lazy2: bool,
+        prev_size: usize,
+    ) -> Self {
         Tok {
             head: vec![NOPOS; 1usize << HASH_BITS],
             head_dict: Vec::new(),
-            prev: vec![NOPOS; WINDOW],
+            prev: vec![NOPOS; prev_size],
+            mask: prev_size - 1,
             mtf: [1, 2, 3, 4],
             i: 0,
             lit_run: 0,
@@ -380,7 +515,7 @@ impl Tok {
         for i in (0..end).rev() {
             if i + MINMATCH <= data.len() {
                 let h = hash4(data, i);
-                self.prev[i & (WINDOW - 1)] = self.head_dict[h];
+                self.prev[i & self.mask] = self.head_dict[h];
                 self.head_dict[h] = i as u32;
             }
         }
@@ -391,7 +526,7 @@ impl Tok {
     fn insert(&mut self, input: &[u8], i: usize) {
         if i + MINMATCH <= input.len() {
             let h = hash4(input, i);
-            self.prev[i & (WINDOW - 1)] = self.head[h];
+            self.prev[i & self.mask] = self.head[h];
             self.head[h] = i as u32;
         }
     }
@@ -491,7 +626,7 @@ impl Tok {
                     break;
                 }
             }
-            cand = self.prev[c & (WINDOW - 1)];
+            cand = self.prev[c & self.mask];
             d -= 1;
         }
         if !self.head_dict.is_empty() {
@@ -511,7 +646,7 @@ impl Tok {
                         break;
                     }
                 }
-                cand = self.prev[c & (WINDOW - 1)];
+                cand = self.prev[c & self.mask];
                 d -= 1;
             }
         }
@@ -593,7 +728,11 @@ impl Tok {
             }
             // lazy-1: короткое совпадение — проверяем позицию i+1; lazy2
             // (высокие уровни) проверяет i+1 и при найденном совпадении:
-            // длинный матч может блокировать ещё более длинный шагом дальше
+            // длинный матч может блокировать ещё более длинный шагом дальше.
+            // PS24.2: rep0 на lazy-позиции проверен замером и ОТКЛОНЁН —
+            // enc −16…17% на fb2/m10 при выигрыше 0.0–0.04 п.п. (rep почти
+            // всегда совпадает с кандидатом через шаг, а extend_len на
+            // rep-офсете читает холодные строки кэша)
             if self.lazy_depth > 0
                 && (self.lazy2 || bl < self.good_len)
                 && i + 1 + MINMATCH <= n
@@ -656,7 +795,10 @@ pub fn encode_dict(input: &[u8], dict: &[u8], level: usize) -> Vec<u8> {
     let nchunks = n.div_ceil(BLOCK).max(1);
     put_uvarint(nchunks as u64, &mut out);
     let (depth, lazy_depth, good_len, lazy2) = level_params(level);
-    let mut tok = Tok::with_params(depth, lazy_depth, good_len, lazy2);
+    // PS24.2: кольцо prev — степень двойки от длины (dict + вход);
+    // для файлов ≤16 МиБ это идентично WINDOW-кольцу без перезаписей
+    let prev_size = (dn + n).next_power_of_two().min(WINDOW);
+    let mut tok = Tok::with_params(depth, lazy_depth, good_len, lazy2, prev_size);
     // prime-проход: позиции словаря в отдельную таблицу head_dict (в
     // обратном порядке), эмиссии нет — декодер имеет тот же словарь
     tok.prime(&full, dn);
@@ -689,7 +831,9 @@ pub fn encode_level(input: &[u8], level: usize) -> Vec<u8> {
     let nchunks = n.div_ceil(BLOCK).max(1);
     put_uvarint(nchunks as u64, &mut out);
     let (depth, lazy_depth, good_len, lazy2) = level_params(level);
-    let mut tok = Tok::with_params(depth, lazy_depth, good_len, lazy2);
+    // PS24.2: кольцо prev — степень двойки от длины входа (см. Tok.mask)
+    let prev_size = n.next_power_of_two().min(WINDOW);
+    let mut tok = Tok::with_params(depth, lazy_depth, good_len, lazy2, prev_size);
     for _ in 0..nchunks {
         let chunk_start = tok.i;
         let target_end = (tok.i + BLOCK).min(n);
@@ -1322,5 +1466,103 @@ mod tests {
             let dec = decode_dict(&enc, &dict, input.len() + 1).expect("уровень");
             assert_eq!(dec, input, "уровень {level}");
         }
+    }
+}
+
+#[cfg(test)]
+mod huff2lv {
+    use super::*;
+    /// декод каждого символа из его собственного кода через 2-уровневую таблицу
+    #[test]
+    fn huff2lv_per_symbol() {
+        // частоты, дающие весь спектр длин 1..15
+        let mut freq = vec![0u32; 300];
+        for (i, f) in freq.iter_mut().enumerate() {
+            *f = 1u32 << (14 - (i % 15)).min(14);
+        }
+        let lens = huff_lengths(&freq);
+        // отладка: гистограмма и проверка Крафта
+        let mut hist = [0u32; 16];
+        let mut kraft = 0u64;
+        for &l in &lens {
+            if l > 0 {
+                hist[l as usize] += 1;
+                kraft += 1u64 << (15 - l);
+            }
+        }
+        println!("hist: {:?}", hist);
+        println!("kraft sum (must be <= 1<<15 = {}): {}", 1u32 << 15, kraft);
+        let codes = canonical_codes(&lens);
+        let t = decode_table(&lens, &codes);
+        for (s, &l) in lens.iter().enumerate().take(8) {
+            println!("sym {s}: len {} code {:x}", l, codes[s]);
+        }
+        println!("sym 240: len {} code {:x}", lens[240], codes[240]);
+        let mut maxlen = 0u8;
+        for (s, &len) in lens.iter().enumerate() {
+            if len == 0 {
+                continue;
+            }
+            maxlen = maxlen.max(len);
+            let len = len as u32;
+            let code = codes[s];
+            let mut br = BitReader {
+                data: &[0u8; 8],
+                pos: 8,
+                acc: code as u64,
+                nbits: len,
+            };
+            let got = br
+                .decode_sym(&t)
+                .unwrap_or_else(|e| panic!("sym {s} len {len} код {code:x}: {e}"));
+            assert_eq!(got, s as u8, "sym {s} len {len} код {code:x}");
+        }
+        assert!(maxlen >= 14, "спектр длин должен доходить до длинных кодов");
+    }
+
+    /// бисекция: поток только с короткими кодами (под-таблиц нет)
+    #[test]
+    fn huff2lv_stream_short_codes() {
+        let mut v = Vec::new();
+        for k in 0..60000u32 {
+            v.push((k % 128) as u8);
+            if k % 97 == 0 {
+                v.push((k % 251 + 1) as u8);
+            }
+        }
+        let enc = encode(&v);
+        assert_eq!(decode(&enc, v.len()).unwrap(), v);
+    }
+
+    /// бисекция: экстремальный перекос — коды len 1 и len 15 вместе + RLE
+    #[test]
+    fn huff2lv_stream_extreme_skew() {
+        let mut v = Vec::new();
+        for k in 0..250000u32 {
+            v.push(if k % 2 == 0 { b'a' } else { b'b' });
+        }
+        // 300 редких байтов (коды до 15 бит)
+        for k in 0..300u32 {
+            v[(811 * (k + 1)) as usize] = (k % 253 + 2) as u8;
+        }
+        // RLE-ран на редком байте
+        v.extend(std::iter::repeat_n(77u8, 70000));
+        let enc = encode(&v);
+        assert_eq!(decode(&enc, v.len()).unwrap(), v);
+    }
+
+    /// бисекция: почти равномерные 120 символов + один редкий (длинный код)
+    #[test]
+    fn huff2lv_stream_one_long() {
+        let mut v = Vec::new();
+        for k in 0..40000u32 {
+            v.push((k % 120) as u8);
+        }
+        // редкий символ 200: 1 на 40000 → код длиной 13-15 бит
+        for k in 0..3 {
+            v[7777 * (k + 1)] = 200;
+        }
+        let enc = encode(&v);
+        assert_eq!(decode(&enc, v.len()).unwrap(), v);
     }
 }
