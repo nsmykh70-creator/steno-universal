@@ -41,6 +41,7 @@ pub mod frec;
 pub mod integrity;
 pub mod lpaq_ctrl;
 pub mod regular;
+pub mod slz;
 pub mod sym_short;
 pub mod train;
 pub mod trie;

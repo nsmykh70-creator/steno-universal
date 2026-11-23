@@ -37,9 +37,11 @@ fn main() {
         Some("unpack") if args.len() >= 5 => unpack_cmd(&args[2], &args[3], &args[4]),
         Some("s21-pack") if args.len() >= 5 => s21_pack_cmd(&args[2], &args[3], &args[4]),
         Some("s21-unpack") if args.len() >= 4 => s21_unpack_cmd(&args[2], &args[3], &args[4..]),
+        Some("slz") if args.len() >= 4 => slz_cmd(&args[2], &args[3]),
+        Some("slz-decode") if args.len() >= 4 => slz_decode_cmd(&args[2], &args[3]),
         Some("bench-s20") if args.len() >= 3 => bench_s20_cmd(&args[2], &args[3..]),
         _ => {
-            eprintln!("использование: steno_file encode <вход> <каталог> | decode <кадр> <выход> | dumpstreams <кадр> <каталог> | frec <ctrl> <каталог> [--order0] | cmz <поток> <каталог> | cmz-decode <файл.cmz> <выход> | cmz-frame <кадр> <каталог> | cmz-frame-decode <файл> <выход> | s21-pack <исходник> <архив> <выход.s21> | s21-unpack <архив.s21> <выход> [--raw-frame] | bench-s20 <файл> [--reps N] | pack <hdr> <ctrl> <data> <кадр> | unpack <каталог> <stem> <выход>");
+            eprintln!("использование: steno_file encode <вход> <каталог> | decode <кадр> <выход> | dumpstreams <кадр> <каталог> | frec <ctrl> <каталог> [--order0] | cmz <поток> <каталог> | cmz-decode <файл.cmz> <выход> | cmz-frame <кадр> <каталог> | cmz-frame-decode <файл> <выход> | s21-pack <исходник> <архив> <выход.s21> | s21-unpack <архив.s21> <выход> [--raw-frame] | slz <вход> <выход.s21> | slz-decode <архив.s21> <выход> | bench-s20 <файл> [--reps N] | pack <hdr> <ctrl> <data> <кадр> | unpack <каталог> <stem> <выход>");
             std::process::exit(2);
         }
     }
@@ -618,6 +620,32 @@ fn bench_s20_cmd(input: &str, flags: &[String]) {
         speed(pipeline_dec),
         s21_ok,
     );
+
+    // --- SLZ (PS22): наш быстрый кодек на тех же байтах ---
+    let t_slz = Instant::now();
+    let slz_stream = steno_uv::slz::encode(&raw);
+    let slz_container = steno_uv::integrity::wrap(&slz_stream, &raw);
+    let slz_enc_d = t_slz.elapsed();
+    let t_slzd = Instant::now();
+    let slz_inner = steno_uv::integrity::try_unwrap(&slz_container).expect("SU21 у slz");
+    let slz_back = steno_uv::slz::decode(slz_inner, raw.len()).expect("slz декодирование");
+    steno_uv::integrity::verify(&slz_container, &slz_back).expect("проверка SU21 у slz");
+    let slz_dec_d = t_slzd.elapsed();
+    row(
+        "PS22-slz",
+        slz_container.len(),
+        speed(slz_enc_d),
+        speed(slz_dec_d),
+        slz_back == raw,
+    );
+    eprintln!(
+        "slz: поток {} Б, контейнер {} Б (конверт {} Б), enc {:.2} c dec {:.2} c",
+        slz_stream.len(),
+        slz_container.len(),
+        steno_uv::integrity::HEADER_LEN,
+        slz_enc_d.as_secs_f64(),
+        slz_dec_d.as_secs_f64()
+    );
     eprintln!(
         "стадии: train {:.1} c | stuv enc {:.1} c dec {:.1} c | cmz enc {:.1} c dec {:.1} c | wrap {:.3} c unwrap {:.1} c",
         train_d.as_secs_f64(),
@@ -687,4 +715,66 @@ fn run_filter(program: &str, args: &[&str], input: &[u8]) -> Option<Vec<u8>> {
     } else {
         None
     }
+}
+
+/// PS22: быстрое сжатие SLZ (LZ77+Huffman) с конвертом SU21.
+fn slz_cmd(input: &str, output: &str) {
+    let raw = fs::read(input).expect("чтение входного файла");
+    let t0 = Instant::now();
+    let stream = steno_uv::slz::encode(&raw);
+    let container = steno_uv::integrity::wrap(&stream, &raw);
+    let dt = t0.elapsed();
+    fs::write(output, &container).expect("запись SLZ-контейнера");
+    println!(
+        "RESULT23\t{}\t{}\t{}\t{}\t{}",
+        input,
+        raw.len(),
+        stream.len(),
+        container.len(),
+        dt.as_secs_f64()
+    );
+    eprintln!(
+        "slz {input}: {} Б → поток {} Б + конверт {} Б = {} Б ({:.2}×, {:.2} c)",
+        raw.len(),
+        stream.len(),
+        steno_uv::integrity::HEADER_LEN,
+        container.len(),
+        raw.len() as f64 / container.len().max(1) as f64,
+        dt.as_secs_f64()
+    );
+}
+
+/// PS22: распаковка SLZ-контейнера (SU21 распознаётся, проверка до записи).
+/// Голый SLZ-поток без конверта тоже принимается.
+fn slz_decode_cmd(input: &str, output: &str) {
+    let data = fs::read(input).expect("чтение SLZ-контейнера");
+    let t0 = Instant::now();
+    let (payload, wrapped) = match steno_uv::integrity::try_unwrap(&data) {
+        Some(inner) => (inner, true),
+        None => (&data[..], false),
+    };
+    let limit = if wrapped {
+        steno_uv::integrity::declared_len(&data).unwrap_or(usize::MAX)
+    } else {
+        usize::MAX
+    };
+    let raw = steno_uv::slz::decode(payload, limit).expect("slz декодирование");
+    if wrapped {
+        steno_uv::integrity::verify(&data, &raw).expect("конверт SU21: проверка целостности");
+    }
+    let dt = t0.elapsed();
+    fs::write(output, &raw).expect("запись исходного файла");
+    println!(
+        "RESULT24\t{}\t{}\t{}\t{}",
+        output,
+        raw.len(),
+        data.len(),
+        dt.as_secs_f64()
+    );
+    eprintln!(
+        "slz-decode {output}: {} Б исходника из {} Б ({:.2} c)",
+        raw.len(),
+        data.len(),
+        dt.as_secs_f64()
+    );
 }
